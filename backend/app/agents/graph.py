@@ -39,6 +39,7 @@ from app.models.schemas import (
     StepResult,
     StepStatus,
     TaskStatus,
+    TypeTextAction,
     WaitAction,
     WaitForTextAction,
 )
@@ -52,6 +53,7 @@ ACTION_REGISTRY = {
     "click_role": ClickRoleAction,
     "fill_label": FillLabelAction,
     "fill_placeholder": FillPlaceholderAction,
+    "type_text": TypeTextAction,
     "select_option": SelectOptionAction,
     "press_key": PressKeyAction,
     "wait": WaitAction,

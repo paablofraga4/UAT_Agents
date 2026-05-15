@@ -67,6 +67,17 @@ class FillPlaceholderAction(BaseModel):
     description: str = ""
 
 
+class TypeTextAction(BaseModel):
+    """Smart text entry. Use for rich-text / chat / contenteditable fields
+    (LinkedIn messages, Slack composer, Notion, Quill, ProseMirror, etc.)
+    where `fill_label` / `fill_placeholder` fail because the target isn't a
+    real <input>/<textarea>."""
+    action: Literal["type_text"] = "type_text"
+    target: str  # any visible label, placeholder or aria-label that identifies the editor
+    value: str
+    description: str = ""
+
+
 class SelectOptionAction(BaseModel):
     action: Literal["select_option"] = "select_option"
     label: str  # the <select> label
@@ -115,6 +126,7 @@ Action = Union[
     ClickRoleAction,
     FillLabelAction,
     FillPlaceholderAction,
+    TypeTextAction,
     SelectOptionAction,
     PressKeyAction,
     WaitAction,

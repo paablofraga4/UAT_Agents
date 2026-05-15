@@ -14,6 +14,7 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"click_role","role":"button","name":"Save","description":"..."}
 - {"action":"fill_label","label":"First name","value":"John","description":"..."}
 - {"action":"fill_placeholder","placeholder":"Search","value":"...","description":"..."}
+- {"action":"type_text","target":"Write a message","value":"hello","description":"..."}
 - {"action":"select_option","label":"Country","value":"Spain","description":"..."}
 - {"action":"press_key","key":"Enter","description":"..."}
 - {"action":"wait","ms":500,"description":"..."}
@@ -26,6 +27,12 @@ Rules:
 - Use ONLY texts/labels you can see in the PAGE CONTEXT, or that you reasonably
   expect to appear after a navigation step.
 - Prefer user-facing locators (text, role, label, placeholder).
+- For chat composers, comment boxes, rich-text editors, message inputs and any
+  field that is NOT a regular HTML <input>/<textarea> (LinkedIn messages, Slack,
+  Notion, Quill, ProseMirror, Lexical, Draft.js, etc.), use `type_text` instead
+  of `fill_placeholder`/`fill_label`. `type_text` falls back to contenteditable.
+- After `type_text` in a chat input, you typically need a separate `click_role`
+  on the Send button or `press_key Enter` to submit.
 - Never produce destructive actions (no delete/wipe/DROP-like operations).
 - Never ask for or handle credentials, cookies, tokens or MFA codes.
 - End the plan with at least one assert_text or wait_for_text that proves success.

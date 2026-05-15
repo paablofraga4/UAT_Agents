@@ -29,6 +29,7 @@ from app.models.schemas import (
     PressKeyAction,
     ScreenshotAction,
     SelectOptionAction,
+    TypeTextAction,
     WaitAction,
     WaitForTextAction,
 )
@@ -137,6 +138,39 @@ def _execute_sync(page: Page, action: Action) -> str:
     if isinstance(action, FillPlaceholderAction):
         page.get_by_placeholder(action.placeholder, exact=False).first.fill(action.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Filled placeholder {action.placeholder!r}"
+    if isinstance(action, TypeTextAction):
+        target = action.target
+        # Try standard real-input locators first.
+        candidates = [
+            lambda: page.get_by_label(target, exact=False).first,
+            lambda: page.get_by_placeholder(target, exact=False).first,
+            lambda: page.get_by_role("textbox", name=target).first,
+        ]
+        for build in candidates:
+            try:
+                loc = build()
+                loc.fill(action.value, timeout=2000)
+                return f"Typed into {target!r}"
+            except Exception:
+                continue
+        # Fallback: contenteditable (LinkedIn chat, Slack, Notion, ProseMirror...).
+        # Match aria-label / aria-placeholder / data-placeholder loosely.
+        sel = (
+            f'[contenteditable="true"][aria-label*="{target}" i], '
+            f'[contenteditable=""][aria-label*="{target}" i], '
+            f'[contenteditable="true"][aria-placeholder*="{target}" i], '
+            f'[contenteditable="true"][data-placeholder*="{target}" i], '
+            f'[role="textbox"][aria-label*="{target}" i]'
+        )
+        ce = page.locator(sel).first
+        ce.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+        ce.click()
+        # Clear + type. insert_text is the most reliable for rich editors.
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Delete")
+        page.keyboard.insert_text(action.value)
+        return f"Typed into contenteditable {target!r}"
+
     if isinstance(action, SelectOptionAction):
         page.get_by_label(action.label, exact=False).first.select_option(label=action.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Selected {action.value!r} in {action.label!r}"
