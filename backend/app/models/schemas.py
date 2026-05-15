@@ -120,6 +120,17 @@ class ExtractContextAction(BaseModel):
     description: str = ""
 
 
+class UploadFileAction(BaseModel):
+    """Attach one or more local files to a file input. `target` is any visible
+    label/aria/placeholder/button text near the input (e.g. "Adjuntar",
+    "Upload", "Sube tu CV"). The runner resolves the underlying
+    <input type=file>, even if it's hidden behind a styled label/button."""
+    action: Literal["upload_file"] = "upload_file"
+    target: str
+    paths: list[str]  # absolute local paths
+    description: str = ""
+
+
 Action = Union[
     GotoAction,
     ClickTextAction,
@@ -134,6 +145,7 @@ Action = Union[
     ScreenshotAction,
     AssertTextAction,
     ExtractContextAction,
+    UploadFileAction,
 ]
 
 

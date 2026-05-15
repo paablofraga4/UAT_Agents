@@ -24,6 +24,7 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"screenshot","description":"..."}
 - {"action":"assert_text","text":"Patient created","description":"..."}
 - {"action":"extract_context","description":"..."}
+- {"action":"upload_file","target":"Adjuntar","paths":["C:/abs/path/to/file.pdf"],"description":"..."}
 
 Operating rules:
 - LANGUAGE: match the visible UI language. If the page shows Spanish ("Mensajes",
@@ -32,6 +33,14 @@ Operating rules:
 - For chat composers, comment boxes and rich-text editors (LinkedIn, Slack,
   Notion, ProseMirror, Quill, Lexical, Draft.js…), use `type_text`. After
   typing, send with `press_key Enter` or click the Send button.
+- For Send/Submit/Upload icon buttons that show no text (only an icon), prefer
+  `click_role` with the button's aria-label as `name` (e.g.
+  {"action":"click_role","role":"button","name":"Enviar"}). The runner
+  automatically falls back through role/aria-label/title/text strategies.
+- For file pickers, NEVER `click_text("Subir")` — that opens a native OS
+  dialog Playwright can't drive. Use `upload_file` with `target` set to the
+  visible button/label text (e.g. "Adjuntar", "Sube tu CV") and `paths` as
+  absolute local paths.
 - React to the previous step's result. If a step FAILED, do not repeat it
   blindly: try a different locator, scroll, wait longer, or open a different
   panel. If it SUCCEEDED, continue to the next sub-goal.
@@ -40,8 +49,14 @@ Operating rules:
 - Decide `done` only when the CURRENT PAGE CONTEXT contains clear visual
   evidence the user's goal is fulfilled (e.g. message in conversation thread,
   success toast, new record visible).
-- Decide `give_up` after a few consecutive failures on the same sub-goal, or
-  when blocked by a CAPTCHA / login challenge / missing data.
+- DO NOT `give_up` just because the page doesn't show what you expected on the
+  first observation. SPAs (LinkedIn, Salesforce, Slack) often need 1–3 seconds
+  for the next view to render. First try: a short `wait` (1000–2000ms),
+  re-observe with `extract_context`, scroll by pressing `End` / `PageDown`,
+  or navigate to a more direct URL (e.g. /messaging/, /search/).
+- Decide `give_up` ONLY when truly blocked: CAPTCHA, login wall after timeout,
+  missing required data the user did not provide, or 3 consecutive different
+  strategies have all failed for the same sub-goal.
 - Never produce destructive actions; never ask for or handle credentials.
 - Keep `thought` concise (≤ 2 sentences).
 
@@ -72,6 +87,7 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"screenshot","description":"..."}
 - {"action":"assert_text","text":"Patient created","description":"..."}
 - {"action":"extract_context","description":"..."}
+- {"action":"upload_file","target":"Adjuntar","paths":["C:/abs/path/to/file.pdf"],"description":"..."}
 
 Rules:
 - LANGUAGE: match the language of the visible UI. If PAGE CONTEXT shows Spanish

@@ -10,6 +10,7 @@ which keeps Playwright off the host event loop entirely.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -30,6 +31,7 @@ from app.models.schemas import (
     ScreenshotAction,
     SelectOptionAction,
     TypeTextAction,
+    UploadFileAction,
     WaitAction,
     WaitForTextAction,
 )
@@ -37,6 +39,8 @@ from app.storage.evidence import screenshot_path
 
 
 DEFAULT_TIMEOUT_MS = 8000
+SETTLE_MS = 800
+SETTLE_AFTER = {"click_text", "click_role", "goto", "press_key", "select_option", "upload_file"}
 MAX_VISIBLE_TEXT = 6000
 MAX_INTERACTIVE = 60
 
@@ -122,16 +126,124 @@ async def observe(session: BrowserSession, task_id: str) -> PageContext:
     )
 
 
+def _try_click(page: Page, locator_builders: list[tuple[str, Any]], per_try_ms: int = 1500) -> str:
+    """Try a sequence of (label, locator-factory) pairs. Returns the label of the
+    first one that succeeds. Each attempt: wait for visibility, then click. If the
+    element is disabled (e.g. Send button before composer registers input), wait
+    briefly for it to become enabled."""
+    last_err: Exception | None = None
+    for label, build in locator_builders:
+        try:
+            loc = build()
+            loc.wait_for(state="visible", timeout=per_try_ms)
+            try:
+                loc.click(timeout=per_try_ms)
+            except Exception:
+                # Element may be temporarily disabled (e.g. Send waiting for input
+                # event from a contenteditable). Re-poll for enabled state.
+                loc.click(timeout=DEFAULT_TIMEOUT_MS, force=False)
+            return label
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or ActionExecutionError("no locator matched")
+
+
+def _click_strategies(page: Page, name: str, role: str | None = None) -> list[tuple[str, Any]]:
+    """Build a fallback chain to find a clickable element by visible name / aria-label.
+    `role` narrows the first attempts (button/link/tab/etc.); when None, we try the
+    common interactive roles in order."""
+    n = name.strip()
+    roles = [role] if role else ["button", "link", "menuitem", "tab", "checkbox", "radio"]
+    builders: list[tuple[str, Any]] = []
+    for r in roles:
+        builders.append((f"role={r} name={n!r}", lambda r=r: page.get_by_role(r, name=n).first))
+        builders.append((f"role={r} name~={n!r}", lambda r=r: page.get_by_role(r, name=n, exact=False).first))
+    # aria-label exact + substring (case-insensitive)
+    builders.append((f"aria-label={n!r}", lambda: page.locator(f'[aria-label="{n}" i]:visible').first))
+    builders.append((f"aria-label*={n!r}", lambda: page.locator(f'[aria-label*="{n}" i]:visible').first))
+    # title attribute (icon buttons sometimes only have title)
+    builders.append((f"title*={n!r}", lambda: page.locator(f'[title*="{n}" i]:visible').first))
+    # text constrained to clickable elements (avoid grabbing a non-clickable span)
+    builders.append((f"clickable text={n!r}", lambda: page.locator(
+        f'button:has-text("{n}"), a:has-text("{n}"), [role="button"]:has-text("{n}"), '
+        f'[role="link"]:has-text("{n}"), [role="tab"]:has-text("{n}"), '
+        f'[role="menuitem"]:has-text("{n}")'
+    ).first))
+    # last resort: any visible text node (original behaviour)
+    builders.append((f"text={n!r}", lambda: page.get_by_text(n, exact=False).first))
+    return builders
+
+
+def _resolve_file_input(page: Page, target: str):
+    """Locate the underlying <input type=file>, even when hidden behind a styled
+    label/button. Strategy: try by accessible name first, then sniff the input
+    closest to the target text."""
+    t = target.strip()
+    # 1) Direct: input with matching aria-label / name / id / data-testid
+    for sel in (
+        f'input[type="file"][aria-label*="{t}" i]',
+        f'input[type="file"][name*="{t}" i]',
+        f'input[type="file"][id*="{t}" i]',
+        f'input[type="file"][data-testid*="{t}" i]',
+    ):
+        loc = page.locator(sel).first
+        if loc.count() > 0:
+            return loc
+    # 2) Indirect: find a clickable ancestor with matching text/aria-label,
+    #    then look for the file input inside it (or its <label for=...> target).
+    for parent_sel in (
+        f'label:has-text("{t}")',
+        f'button:has-text("{t}")',
+        f'[role="button"]:has-text("{t}")',
+        f'[aria-label*="{t}" i]',
+    ):
+        parent = page.locator(parent_sel).first
+        if parent.count() == 0:
+            continue
+        # input inside the parent
+        inner = parent.locator('input[type="file"]').first
+        if inner.count() > 0:
+            return inner
+        # <label for="X"> → input#X
+        try:
+            for_id = parent.evaluate("el => el.getAttribute && el.getAttribute('for')")
+            if for_id:
+                ref = page.locator(f'input[type="file"]#{for_id}').first
+                if ref.count() > 0:
+                    return ref
+        except Exception:
+            pass
+    # 3) Fallback: the first file input on the page
+    any_input = page.locator('input[type="file"]').first
+    if any_input.count() > 0:
+        return any_input
+    raise ActionExecutionError(f"upload_file: no <input type=file> found for {target!r}")
+
+
+# Dispatch input/change events on contenteditable so frameworks (React, Lexical,
+# ProseMirror, Draft.js, Quill) detect the change and enable Send buttons.
+_CE_NOTIFY_JS = r"""
+(el) => {
+    try {
+        el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText' }));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText' }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) {}
+}
+"""
+
+
 def _execute_sync(page: Page, action: Action) -> str:
     if isinstance(action, GotoAction):
         page.goto(action.url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS * 2)
         return f"Navigated to {action.url}"
     if isinstance(action, ClickTextAction):
-        page.get_by_text(action.text, exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
-        return f"Clicked text {action.text!r}"
+        used = _try_click(page, _click_strategies(page, action.text))
+        return f"Clicked text {action.text!r} via {used}"
     if isinstance(action, ClickRoleAction):
-        page.get_by_role(action.role, name=action.name).first.click(timeout=DEFAULT_TIMEOUT_MS)
-        return f"Clicked {action.role}={action.name!r}"
+        used = _try_click(page, _click_strategies(page, action.name, role=action.role))
+        return f"Clicked {action.role}={action.name!r} via {used}"
     if isinstance(action, FillLabelAction):
         page.get_by_label(action.label, exact=False).first.fill(action.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Filled label {action.label!r}"
@@ -200,7 +312,17 @@ def _execute_sync(page: Page, action: Action) -> str:
         except Exception:
             pass
         page.keyboard.insert_text(action.value)
+        # Notify frameworks (React/Lexical/ProseMirror) so Send buttons enable.
+        try:
+            loc.evaluate(_CE_NOTIFY_JS)
+        except Exception:
+            pass
         return f"Typed into contenteditable {target!r} via {used}"
+
+    if isinstance(action, UploadFileAction):
+        loc = _resolve_file_input(page, action.target)
+        loc.set_input_files(action.paths)
+        return f"Uploaded {len(action.paths)} file(s) into {action.target!r}"
 
     if isinstance(action, SelectOptionAction):
         page.get_by_label(action.label, exact=False).first.select_option(label=action.value, timeout=DEFAULT_TIMEOUT_MS)
@@ -241,6 +363,18 @@ async def execute_action(session: BrowserSession, task_id: str, action: Action) 
             raise
         except Exception as e:
             raise ActionExecutionError(f"{action.action} failed: {e}") from e
+
+        # Auto-settle after navigations / clicks: give SPAs a moment to render
+        # the next view before the next observation happens.
+        if action.action in SETTLE_AFTER:
+            try:
+                await broker.run_on_page(
+                    session.session_id,
+                    lambda p: p.wait_for_load_state("domcontentloaded", timeout=3000),
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(SETTLE_MS / 1000)
 
     shot = await take_screenshot(session, task_id, action.action)
     return {"message": msg, "screenshot": shot}

@@ -41,6 +41,7 @@ from app.models.schemas import (
     StepStatus,
     TaskStatus,
     TypeTextAction,
+    UploadFileAction,
     WaitAction,
     WaitForTextAction,
 )
@@ -62,12 +63,13 @@ ACTION_REGISTRY = {
     "screenshot": ScreenshotAction,
     "assert_text": AssertTextAction,
     "extract_context": ExtractContextAction,
+    "upload_file": UploadFileAction,
 }
 
 
 MAX_STEPS = 25
 MAX_CONSECUTIVE_FAILURES = 3
-PAGE_TEXT_LIMIT_FOR_LLM = 2500
+PAGE_TEXT_LIMIT_FOR_LLM = 5000
 
 
 class AgentState(TypedDict, total=False):
