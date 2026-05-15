@@ -24,6 +24,10 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"extract_context","description":"..."}
 
 Rules:
+- LANGUAGE: match the language of the visible UI. If PAGE CONTEXT shows Spanish
+  ("Mensajes", "Buscar", "Enviar"), use Spanish strings in your action targets
+  ("Buscar mensajes", "Escribe un mensaje", "Enviar"); for English UIs use
+  English. Never use English labels against a Spanish UI.
 - Use ONLY texts/labels you can see in the PAGE CONTEXT, or that you reasonably
   expect to appear after a navigation step.
 - Prefer user-facing locators (text, role, label, placeholder).

@@ -159,8 +159,14 @@ def _execute_sync(page: Page, action: Action) -> str:
             f'[contenteditable="true"][data-placeholder*="{target}" i], '
             f'[role="textbox"][aria-label*="{target}" i]'
         )
-        # 3) Last-resort: ANY visible contenteditable / role=textbox on the page.
-        sel_any = '[contenteditable="true"], [contenteditable=""], [role="textbox"]'
+        # 3) Last-resort: ANY visible text-entry element on the page (real inputs,
+        #    textareas, contenteditables, role=textbox). Prefers the focused one.
+        sel_any = (
+            '*:focus, '
+            'input[type="text"], input[type="search"], input:not([type]), '
+            'textarea, '
+            '[contenteditable="true"], [contenteditable=""], [role="textbox"]'
+        )
 
         loc = None
         for sel, src in ((sel_target, "target"), (sel_any, "any")):
@@ -177,8 +183,17 @@ def _execute_sync(page: Page, action: Action) -> str:
                 f"type_text: could not find any input/contenteditable matching {target!r}"
             )
 
+        # If it's a real <input>/<textarea>, .fill() is the most reliable path.
+        try:
+            tag = (loc.evaluate("el => el.tagName") or "").lower()
+        except Exception:
+            tag = ""
+        if tag in ("input", "textarea"):
+            loc.fill(action.value)
+            return f"Filled {target!r} via {used}"
+
+        # Otherwise it's a contenteditable / rich editor: click + insert_text.
         loc.click()
-        # Best-effort clear; ignore failures (some editors don't allow Ctrl+A).
         try:
             page.keyboard.press("Control+A")
             page.keyboard.press("Delete")
