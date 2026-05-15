@@ -245,18 +245,18 @@ async def node_report(state: AgentState) -> AgentState:
 
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("observe", node_observe)
-    g.add_node("plan", node_plan)
-    g.add_node("execute", node_execute)
-    g.add_node("validate", node_validate)
-    g.add_node("report", node_report)
+    g.add_node("observer", node_observe)
+    g.add_node("planner", node_plan)
+    g.add_node("executor", node_execute)
+    g.add_node("validator", node_validate)
+    g.add_node("reporter", node_report)
 
-    g.set_entry_point("observe")
-    g.add_edge("observe", "plan")
-    g.add_edge("plan", "execute")
-    g.add_edge("execute", "validate")
-    g.add_edge("validate", "report")
-    g.add_edge("report", END)
+    g.set_entry_point("observer")
+    g.add_edge("observer", "planner")
+    g.add_edge("planner", "executor")
+    g.add_edge("executor", "validator")
+    g.add_edge("validator", "reporter")
+    g.add_edge("reporter", END)
     return g.compile()
 
 
