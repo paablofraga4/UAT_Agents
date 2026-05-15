@@ -40,6 +40,7 @@ from app.models.schemas import (
     StepResult,
     StepStatus,
     TaskStatus,
+    ScrollAction,
     TypeTextAction,
     UploadFileAction,
     WaitAction,
@@ -64,6 +65,7 @@ ACTION_REGISTRY = {
     "assert_text": AssertTextAction,
     "extract_context": ExtractContextAction,
     "upload_file": UploadFileAction,
+    "scroll": ScrollAction,
 }
 
 

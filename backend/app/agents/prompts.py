@@ -25,6 +25,10 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"assert_text","text":"Patient created","description":"..."}
 - {"action":"extract_context","description":"..."}
 - {"action":"upload_file","target":"Adjuntar","paths":["C:/abs/path/to/file.pdf"],"description":"..."}
+- {"action":"scroll","target":"Nadia","direction":"down","amount":600,"description":"..."}
+  (target is OPTIONAL — when given, scrolls the nearest scrollable container
+  around an element matching that text/aria-label, which is what you need for
+  chat lists, dropdowns and infinite feeds. direction: down|up|bottom|top.)
 
 Operating rules:
 - LANGUAGE: match the visible UI language. If the page shows Spanish ("Mensajes",
@@ -49,14 +53,38 @@ Operating rules:
 - Decide `done` only when the CURRENT PAGE CONTEXT contains clear visual
   evidence the user's goal is fulfilled (e.g. message in conversation thread,
   success toast, new record visible).
+- ABSENCE OF EVIDENCE IS NOT EVIDENCE OF FAILURE. The PAGE CONTEXT only contains
+  the first ~5KB of `document.body.innerText` plus up to ~60 interactive labels.
+  Long lists (chats, contacts, search results, feeds) are commonly clipped or
+  rendered inside a SCROLLABLE PANEL whose lower items are NOT in the snapshot
+  even though they exist in the DOM. If the target name/text isn't in the
+  snapshot, ASSUME IT'S BELOW THE FOLD, not absent.
+
+- FIND-A-PERSON / FIND-AN-ITEM WORKFLOW (chats, conversations, contacts, rows
+  in a list). Always follow this order before considering give_up:
+    1. Look for a search box on the page (often labeled "Buscar", "Search",
+       "Buscar mensajes"). If present, use `type_text` with that target and
+       the person's name, then `wait` 800–1500ms and `extract_context`.
+    2. If no search box, `scroll` the chat/contact list (use the panel's
+       container by passing a visible nearby name as `target`, e.g.
+       `{"action":"scroll","target":"<a name you DO see in the list>",
+       "direction":"down","amount":800}`), then `extract_context`.
+    3. Repeat scroll up to 5 times. Only after both search AND ≥3 scrolls
+       have failed to surface the target, consider it truly missing.
+
 - DO NOT `give_up` just because the page doesn't show what you expected on the
   first observation. SPAs (LinkedIn, Salesforce, Slack) often need 1–3 seconds
   for the next view to render. First try: a short `wait` (1000–2000ms),
-  re-observe with `extract_context`, scroll by pressing `End` / `PageDown`,
-  or navigate to a more direct URL (e.g. /messaging/, /search/).
+  re-observe with `extract_context`, `scroll` the relevant container, or
+  navigate to a more direct URL (e.g. /messaging/, /search/).
+
 - Decide `give_up` ONLY when truly blocked: CAPTCHA, login wall after timeout,
-  missing required data the user did not provide, or 3 consecutive different
-  strategies have all failed for the same sub-goal.
+  missing required data the user did not provide, or you have actually tried
+  AT LEAST 3 different recovery strategies (wait+re-observe, search, scroll,
+  alternative URL, alternative locator) for the same sub-goal and all failed.
+  NEVER `give_up` after only 1 successful step — that means you've barely
+  started. If your last action SUCCEEDED, the next decision should almost
+  always be `act`, not `give_up`.
 - Never produce destructive actions; never ask for or handle credentials.
 - Keep `thought` concise (≤ 2 sentences).
 
@@ -88,6 +116,7 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 - {"action":"assert_text","text":"Patient created","description":"..."}
 - {"action":"extract_context","description":"..."}
 - {"action":"upload_file","target":"Adjuntar","paths":["C:/abs/path/to/file.pdf"],"description":"..."}
+- {"action":"scroll","target":"<nearby visible text>","direction":"down","amount":600,"description":"..."}
 
 Rules:
 - LANGUAGE: match the language of the visible UI. If PAGE CONTEXT shows Spanish

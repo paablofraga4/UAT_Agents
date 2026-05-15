@@ -29,6 +29,7 @@ from app.models.schemas import (
     PageContext,
     PressKeyAction,
     ScreenshotAction,
+    ScrollAction,
     SelectOptionAction,
     TypeTextAction,
     UploadFileAction,
@@ -40,7 +41,7 @@ from app.storage.evidence import screenshot_path
 
 DEFAULT_TIMEOUT_MS = 8000
 SETTLE_MS = 800
-SETTLE_AFTER = {"click_text", "click_role", "goto", "press_key", "select_option", "upload_file"}
+SETTLE_AFTER = {"click_text", "click_role", "goto", "press_key", "select_option", "upload_file", "scroll"}
 MAX_VISIBLE_TEXT = 6000
 MAX_INTERACTIVE = 60
 
@@ -323,6 +324,46 @@ def _execute_sync(page: Page, action: Action) -> str:
         loc = _resolve_file_input(page, action.target)
         loc.set_input_files(action.paths)
         return f"Uploaded {len(action.paths)} file(s) into {action.target!r}"
+
+    if isinstance(action, ScrollAction):
+        # Find the nearest scrollable ancestor of an element matching `target`,
+        # falling back to window scrolling. This is what unblocks chat lists,
+        # dropdowns and infinite feeds where document.scrollingElement is fine
+        # but the actually-overflowing element is a nested div.
+        js = r"""
+        ({target, direction, amount}) => {
+            const findScrollable = (el) => {
+                while (el && el !== document.body && el !== document.documentElement) {
+                    const cs = getComputedStyle(el);
+                    const oy = cs.overflowY;
+                    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) {
+                        return el;
+                    }
+                    el = el.parentElement;
+                }
+                return document.scrollingElement || document.documentElement;
+            };
+            let anchor = null;
+            if (target) {
+                const t = target.toLowerCase();
+                const cands = Array.from(document.querySelectorAll('*')).filter(el => {
+                    const txt = (el.innerText || '').trim().toLowerCase();
+                    const al = (el.getAttribute && el.getAttribute('aria-label') || '').toLowerCase();
+                    return (txt && txt.includes(t) && txt.length < 200) || (al && al.includes(t));
+                });
+                anchor = cands[0] || null;
+            }
+            const container = findScrollable(anchor || document.body);
+            const before = container.scrollTop;
+            if (direction === 'bottom') container.scrollTop = container.scrollHeight;
+            else if (direction === 'top') container.scrollTop = 0;
+            else if (direction === 'up') container.scrollTop = Math.max(0, container.scrollTop - amount);
+            else container.scrollTop = container.scrollTop + amount;
+            return {moved: container.scrollTop - before, top: container.scrollTop, max: container.scrollHeight};
+        }
+        """
+        info = page.evaluate(js, {"target": action.target, "direction": action.direction, "amount": action.amount})
+        return f"Scrolled {action.direction} (Δ={info.get('moved')}px, top={info.get('top')}/{info.get('max')})"
 
     if isinstance(action, SelectOptionAction):
         page.get_by_label(action.label, exact=False).first.select_option(label=action.value, timeout=DEFAULT_TIMEOUT_MS)

@@ -120,6 +120,18 @@ class ExtractContextAction(BaseModel):
     description: str = ""
 
 
+class ScrollAction(BaseModel):
+    """Scroll the page or a specific container. If `target` is given, the runner
+    finds the nearest scrollable container around an element matching that text/
+    aria-label and scrolls it (works for chat lists, dropdowns, infinite feeds).
+    Without `target`, scrolls the whole page. `direction` defaults to "down"."""
+    action: Literal["scroll"] = "scroll"
+    target: str = ""  # optional: visible text / aria-label inside the scrollable container
+    direction: Literal["down", "up", "bottom", "top"] = "down"
+    amount: int = Field(default=600, ge=50, le=20000)  # px for down/up
+    description: str = ""
+
+
 class UploadFileAction(BaseModel):
     """Attach one or more local files to a file input. `target` is any visible
     label/aria/placeholder/button text near the input (e.g. "Adjuntar",
@@ -145,6 +157,7 @@ Action = Union[
     ScreenshotAction,
     AssertTextAction,
     ExtractContextAction,
+    ScrollAction,
     UploadFileAction,
 ]
 
