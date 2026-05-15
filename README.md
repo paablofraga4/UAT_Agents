@@ -81,13 +81,16 @@ pip install -r requirements.txt
 playwright install chromium
 cp ../.env.example .env
 # edit .env and set OPENAI_API_KEY
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8765
 ```
+
+> Port 8000 is often reserved by Windows (Hyper-V/WSL excluded port range → `WinError 10013`). 8765 is a safe default.
 
 ### 2. Frontend
 
 ```bash
 cd frontend
+echo "NEXT_PUBLIC_API_BASE=http://127.0.0.1:8765" > .env.local
 npm install
 npm run dev
 ```
