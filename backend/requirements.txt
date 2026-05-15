@@ -8,7 +8,7 @@ openai==1.57.0
 langgraph==0.2.59
 langchain-core==0.3.21
 langchain-openai==0.2.14
-langfuse==2.55.1
+langfuse>=2.60,<3
 aiosqlite==0.20.0
 websockets==13.1
 python-multipart==0.0.19
