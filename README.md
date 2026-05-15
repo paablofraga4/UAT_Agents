@@ -81,7 +81,9 @@ pip install -r requirements.txt
 playwright install chromium
 cp ../.env.example .env
 # edit .env and set OPENAI_API_KEY
-uvicorn app.main:app --reload --port 8765
+python run.py --reload          # use this on Windows (sets Proactor loop policy)
+# or, on macOS / Linux:
+# uvicorn app.main:app --reload --port 8765
 ```
 
 > Port 8000 is often reserved by Windows (Hyper-V/WSL excluded port range → `WinError 10013`). 8765 is a safe default.
