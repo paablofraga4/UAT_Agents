@@ -69,9 +69,12 @@ The agent **never** receives passwords, MFA codes, cookies or tokens. It only se
 
 ### 1. Backend
 
+> **Requires Python 3.11 or 3.12.** On Python 3.14 some deps lack prebuilt wheels and pip will try to compile native code (Rust + MSVC).
+
 ```bash
 cd backend
-python -m venv .venv
+py -3.12 -m venv .venv          # Windows: pick 3.12 explicitly
+# python3.12 -m venv .venv      # macOS / Linux
 . .venv/Scripts/activate           # Windows
 # source .venv/bin/activate        # macOS / Linux
 pip install -r requirements.txt
