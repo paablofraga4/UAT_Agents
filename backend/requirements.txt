@@ -1,0 +1,14 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+playwright==1.49.0
+openai==1.57.0
+langgraph==0.2.59
+langchain-core==0.3.21
+langchain-openai==0.2.14
+langfuse==2.55.1
+aiosqlite==0.20.0
+websockets==13.1
+python-multipart==0.0.19
