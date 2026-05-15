@@ -1,13 +1,15 @@
-"""LangGraph-based multi-agent workflow.
+"""LangGraph multi-agent workflow.
 
-Nodes:
-    observe   → percibe el estado actual de la página
-    plan      → genera un Plan estructurado (allowlist)
-    execute   → ejecuta cada paso a través del Browser Runner
-    validate  → comprueba si el objetivo se cumplió
-    report    → escribe el informe Markdown de evidencias
+ReAct loop:
 
-Flujo: observe → plan → execute → validate → report
+    observer → pilot ──act──► executor → observer (cycle)
+                  │
+                  ├──done────► reporter → END
+                  └──give_up─► reporter → END
+
+The Pilot decides ONE action at a time given the live page context and the
+history of prior steps. This is far more robust on real, dynamic SPAs (LinkedIn,
+Salesforce, Slack…) than a one-shot multi-step plan.
 """
 from __future__ import annotations
 
@@ -32,7 +34,6 @@ from app.models.schemas import (
     FillPlaceholderAction,
     GotoAction,
     PageContext,
-    Plan,
     PressKeyAction,
     ScreenshotAction,
     SelectOptionAction,
@@ -64,17 +65,24 @@ ACTION_REGISTRY = {
 }
 
 
+MAX_STEPS = 25
+MAX_CONSECUTIVE_FAILURES = 3
+PAGE_TEXT_LIMIT_FOR_LLM = 2500
+
+
 class AgentState(TypedDict, total=False):
     task_id: str
     session_id: str
     instruction: str
     page_context: dict
-    plan: dict
+    interpreted_task: str
     step_results: list[dict]
+    consecutive_failures: int
+    done: bool
+    give_up: bool
     success: bool
     summary: str
     report_path: str
-    failed: bool
     error: str
 
 
@@ -91,7 +99,10 @@ async def _save_task(state: AgentState, status: TaskStatus) -> None:
         "instruction": state["instruction"],
         "status": status.value,
         "created_at": datetime.utcnow().isoformat(),
-        "plan_json": json.dumps(state.get("plan")) if state.get("plan") else None,
+        "plan_json": json.dumps({
+            "interpreted_task": state.get("interpreted_task", ""),
+            "steps": [s.get("action") for s in state.get("step_results", [])],
+        }) if state.get("step_results") else None,
         "steps_json": json.dumps(state.get("step_results", []), default=str),
         "report_path": state.get("report_path"),
         "success": int(state["success"]) if "success" in state else None,
@@ -107,109 +118,142 @@ def _parse_action(raw: dict) -> Action:
     return cls(**raw)
 
 
+def _trimmed_context(ctx: dict) -> dict:
+    """Cap page text size for the LLM prompt."""
+    out = dict(ctx)
+    text = out.get("visible_text") or ""
+    if len(text) > PAGE_TEXT_LIMIT_FOR_LLM:
+        out["visible_text"] = text[:PAGE_TEXT_LIMIT_FOR_LLM] + "…[truncated]"
+    out.pop("screenshot_path", None)
+    return out
+
+
+def _history_for_llm(steps: list[dict]) -> list[dict]:
+    """Compact history for the LLM (last 8 steps, no screenshots/timestamps)."""
+    out = []
+    for s in steps[-8:]:
+        out.append({
+            "index": s.get("index"),
+            "action": s.get("action"),
+            "status": s.get("status"),
+            "message": s.get("message"),
+            "error": s.get("error"),
+        })
+    return out
+
+
 # ---------- nodes ----------
 
 async def node_observe(state: AgentState) -> AgentState:
     session = broker.get(state["session_id"])
-    await _emit(state["task_id"], "log", message="Observing current page…")
     ctx: PageContext = await observe(session, state["task_id"])
     state["page_context"] = ctx.model_dump()
-    await _emit(
-        state["task_id"], "screenshot",
-        path=relative_to_evidence(Path(ctx.screenshot_path)) if ctx.screenshot_path else None,
-    )
+    if ctx.screenshot_path:
+        await _emit(
+            state["task_id"], "screenshot",
+            path=relative_to_evidence(Path(ctx.screenshot_path)),
+        )
     return state
 
 
-async def node_plan(state: AgentState) -> AgentState:
-    await _save_task(state, TaskStatus.PLANNING)
-    await _emit(state["task_id"], "log", message="Planner: generating plan…")
+async def node_pilot(state: AgentState) -> AgentState:
+    state.setdefault("step_results", [])
+    state.setdefault("consecutive_failures", 0)
 
-    user_msg = json.dumps({
-        "instruction": state["instruction"],
-        "page_context": state["page_context"],
-    }, ensure_ascii=False)
-
-    raw = await llm.chat_json(prompts.PLANNER_SYSTEM, user_msg)
-
-    # Validate strictly via Pydantic — disallowed actions raise here.
-    try:
-        steps = [_parse_action(s) for s in raw.get("steps", [])]
-        plan = Plan(interpreted_task=raw.get("interpreted_task", ""), steps=steps)
-    except Exception as e:
-        state["failed"] = True
-        state["error"] = f"Invalid plan from Planner: {e}"
-        await _emit(state["task_id"], "error", message=state["error"])
+    # Stop conditions
+    if len(state["step_results"]) >= MAX_STEPS:
+        state["give_up"] = True
+        state["error"] = f"Reached max steps ({MAX_STEPS})"
+        return state
+    if state["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES:
+        state["give_up"] = True
+        state["error"] = f"{MAX_CONSECUTIVE_FAILURES} consecutive failures"
         return state
 
-    state["plan"] = plan.model_dump()
-    await _emit(state["task_id"], "plan", plan=state["plan"])
-    return state
-
-
-async def node_execute(state: AgentState) -> AgentState:
-    if state.get("failed"):
-        return state
     await _save_task(state, TaskStatus.EXECUTING)
 
-    session = broker.get(state["session_id"])
-    plan = Plan(**state["plan"])
-    results: list[dict] = []
-
-    for idx, action in enumerate(plan.steps):
-        result = StepResult(
-            index=idx,
-            action=action.model_dump(),
-            status=StepStatus.RUNNING,
-            started_at=datetime.utcnow(),
-        )
-        await _emit(state["task_id"], "step_started", index=idx, action=action.model_dump())
-        try:
-            outcome = await execute_action(session, state["task_id"], action)
-            result.status = StepStatus.COMPLETED
-            result.message = outcome.get("message")
-            shot = outcome.get("screenshot")
-            if shot:
-                result.screenshot = relative_to_evidence(Path(shot))
-        except ActionExecutionError as e:
-            result.status = StepStatus.FAILED
-            result.error = str(e)
-        result.finished_at = datetime.utcnow()
-        results.append(result.model_dump(mode="json"))
-        await _emit(state["task_id"], "step_finished", step=results[-1])
-
-        if result.status == StepStatus.FAILED:
-            state["failed"] = True
-            state["error"] = result.error or "Step failed"
-            break
-
-    state["step_results"] = results
-    return state
-
-
-async def node_validate(state: AgentState) -> AgentState:
-    await _save_task(state, TaskStatus.VALIDATING)
-    await _emit(state["task_id"], "log", message="Validator: checking outcome…")
-
-    # Re-observe to get the final page context
-    session = broker.get(state["session_id"])
-    ctx = await observe(session, state["task_id"])
-    state["page_context"] = ctx.model_dump()
-
-    if state.get("failed"):
-        state["success"] = False
-        state["summary"] = state.get("error", "A step failed; execution stopped.")
-        return state
-
     user_msg = json.dumps({
         "instruction": state["instruction"],
-        "steps": state["step_results"],
-        "final_page_context": state["page_context"],
-    }, ensure_ascii=False, default=str)
-    verdict = await llm.chat_json(prompts.VALIDATOR_SYSTEM, user_msg)
-    state["success"] = bool(verdict.get("success", False))
-    state["summary"] = str(verdict.get("summary", ""))
+        "history": _history_for_llm(state["step_results"]),
+        "page_context": _trimmed_context(state["page_context"]),
+    }, ensure_ascii=False)
+
+    raw = await llm.chat_json(prompts.PILOT_SYSTEM, user_msg)
+    decision = (raw.get("decision") or "").lower()
+    thought = raw.get("thought") or ""
+
+    if decision == "done":
+        state["done"] = True
+        state["success"] = True
+        state["summary"] = raw.get("summary") or thought
+        await _emit(state["task_id"], "log", message=f"Pilot: DONE — {state['summary']}")
+        return state
+
+    if decision == "give_up":
+        state["give_up"] = True
+        state["success"] = False
+        state["summary"] = raw.get("reason") or thought or "Agent gave up"
+        await _emit(state["task_id"], "log", message=f"Pilot: GIVE UP — {state['summary']}")
+        return state
+
+    # decision == "act"
+    try:
+        action = _parse_action(raw.get("action") or {})
+    except Exception as e:
+        # Treat as a failure step so the Pilot sees it next round.
+        idx = len(state["step_results"])
+        state["step_results"].append({
+            "index": idx,
+            "action": raw.get("action") or {"action": "unknown"},
+            "status": StepStatus.FAILED.value,
+            "error": f"Invalid action from Pilot: {e}",
+        })
+        state["consecutive_failures"] += 1
+        await _emit(state["task_id"], "log", message=f"Pilot returned invalid action: {e}", level="error")
+        return state
+
+    if not state.get("interpreted_task"):
+        state["interpreted_task"] = thought
+        await _emit(state["task_id"], "plan", plan={
+            "interpreted_task": state["interpreted_task"],
+            "steps": [],
+        })
+
+    # Execute the chosen action immediately (single-step).
+    session = broker.get(state["session_id"])
+    idx = len(state["step_results"])
+    await _emit(state["task_id"], "step_started", index=idx, action=action.model_dump())
+
+    result = StepResult(
+        index=idx,
+        action=action.model_dump(),
+        status=StepStatus.RUNNING,
+        started_at=datetime.utcnow(),
+    )
+    try:
+        outcome = await execute_action(session, state["task_id"], action)
+        result.status = StepStatus.COMPLETED
+        result.message = (outcome.get("message") or "") + (f" — {thought}" if thought else "")
+        shot = outcome.get("screenshot")
+        if shot:
+            result.screenshot = relative_to_evidence(Path(shot))
+        state["consecutive_failures"] = 0
+    except ActionExecutionError as e:
+        result.status = StepStatus.FAILED
+        result.error = str(e)
+        state["consecutive_failures"] += 1
+    result.finished_at = datetime.utcnow()
+
+    serialized = result.model_dump(mode="json")
+    state["step_results"].append(serialized)
+    await _emit(state["task_id"], "step_finished", step=serialized)
     return state
+
+
+def route_after_pilot(state: AgentState) -> str:
+    if state.get("done") or state.get("give_up"):
+        return "reporter"
+    return "observer"
 
 
 async def node_report(state: AgentState) -> AgentState:
@@ -218,7 +262,7 @@ async def node_report(state: AgentState) -> AgentState:
 
     user_msg = json.dumps({
         "instruction": state["instruction"],
-        "interpreted_task": state.get("plan", {}).get("interpreted_task"),
+        "interpreted_task": state.get("interpreted_task"),
         "success": state.get("success"),
         "summary": state.get("summary"),
         "steps": state.get("step_results", []),
@@ -228,7 +272,6 @@ async def node_report(state: AgentState) -> AgentState:
     folder = task_dir(state["session_id"], state["task_id"])
     report_path = folder / "report.md"
     write_text(report_path, md)
-    write_json(folder / "plan.json", state.get("plan"))
     write_json(folder / "steps.json", state.get("step_results", []))
 
     state["report_path"] = relative_to_evidence(report_path)
@@ -248,16 +291,15 @@ async def node_report(state: AgentState) -> AgentState:
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("observer", node_observe)
-    g.add_node("planner", node_plan)
-    g.add_node("executor", node_execute)
-    g.add_node("validator", node_validate)
+    g.add_node("pilot", node_pilot)
     g.add_node("reporter", node_report)
 
     g.set_entry_point("observer")
-    g.add_edge("observer", "planner")
-    g.add_edge("planner", "executor")
-    g.add_edge("executor", "validator")
-    g.add_edge("validator", "reporter")
+    g.add_edge("observer", "pilot")
+    g.add_conditional_edges("pilot", route_after_pilot, {
+        "observer": "observer",
+        "reporter": "reporter",
+    })
     g.add_edge("reporter", END)
     return g.compile()
 
@@ -270,5 +312,7 @@ async def run_task(task_id: str, session_id: str, instruction: str) -> AgentStat
         "task_id": task_id,
         "session_id": session_id,
         "instruction": instruction,
+        "step_results": [],
+        "consecutive_failures": 0,
     }
-    return await graph.ainvoke(state)
+    return await graph.ainvoke(state, config={"recursion_limit": MAX_STEPS * 3 + 10})
