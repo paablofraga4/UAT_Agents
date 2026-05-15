@@ -33,6 +33,15 @@ Rules:
   of `fill_placeholder`/`fill_label`. `type_text` falls back to contenteditable.
 - After `type_text` in a chat input, you typically need a separate `click_role`
   on the Send button or `press_key Enter` to submit.
+- To send a chat message to a person you must FIRST open their conversation
+  (e.g. click their name in the conversation list). Don't try to type before
+  the composer is on screen. Insert short `wait` (500-1500ms) or
+  `wait_for_text` steps between navigation and typing so dynamic UIs (LinkedIn,
+  Slack, Salesforce…) finish rendering.
+- For `type_text`, choose a `target` that is short and likely to appear in the
+  composer's aria-label or placeholder (e.g. "Write a message", "Reply",
+  "Message", "Comment"). The runner falls back to any visible contenteditable
+  if no exact match is found, so prefer simple targets over long ones.
 - Never produce destructive actions (no delete/wipe/DROP-like operations).
 - Never ask for or handle credentials, cookies, tokens or MFA codes.
 - End the plan with at least one assert_text or wait_for_text that proves success.

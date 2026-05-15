@@ -139,37 +139,53 @@ def _execute_sync(page: Page, action: Action) -> str:
         page.get_by_placeholder(action.placeholder, exact=False).first.fill(action.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Filled placeholder {action.placeholder!r}"
     if isinstance(action, TypeTextAction):
-        target = action.target
-        # Try standard real-input locators first.
-        candidates = [
-            lambda: page.get_by_label(target, exact=False).first,
-            lambda: page.get_by_placeholder(target, exact=False).first,
-            lambda: page.get_by_role("textbox", name=target).first,
-        ]
-        for build in candidates:
+        target = action.target.replace('"', "'")  # avoid breaking the CSS selector
+        # 1) Try standard real-input locators with short timeouts so we fail fast.
+        for build, label in [
+            (lambda: page.get_by_label(target, exact=False).first,        "label"),
+            (lambda: page.get_by_placeholder(target, exact=False).first,  "placeholder"),
+            (lambda: page.get_by_role("textbox", name=target).first,      "role=textbox"),
+        ]:
             try:
-                loc = build()
-                loc.fill(action.value, timeout=2000)
-                return f"Typed into {target!r}"
+                build().fill(action.value, timeout=1500)
+                return f"Typed into {target!r} via {label}"
             except Exception:
                 continue
-        # Fallback: contenteditable (LinkedIn chat, Slack, Notion, ProseMirror...).
-        # Match aria-label / aria-placeholder / data-placeholder loosely.
-        sel = (
+        # 2) contenteditable matched by target text (substring, case-insensitive).
+        sel_target = (
             f'[contenteditable="true"][aria-label*="{target}" i], '
             f'[contenteditable=""][aria-label*="{target}" i], '
             f'[contenteditable="true"][aria-placeholder*="{target}" i], '
             f'[contenteditable="true"][data-placeholder*="{target}" i], '
             f'[role="textbox"][aria-label*="{target}" i]'
         )
-        ce = page.locator(sel).first
-        ce.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-        ce.click()
-        # Clear + type. insert_text is the most reliable for rich editors.
-        page.keyboard.press("Control+A")
-        page.keyboard.press("Delete")
+        # 3) Last-resort: ANY visible contenteditable / role=textbox on the page.
+        sel_any = '[contenteditable="true"], [contenteditable=""], [role="textbox"]'
+
+        loc = None
+        for sel, src in ((sel_target, "target"), (sel_any, "any")):
+            try:
+                cand = page.locator(sel).first
+                cand.wait_for(state="visible", timeout=2500)
+                loc = cand
+                used = src
+                break
+            except Exception:
+                continue
+        if loc is None:
+            raise ActionExecutionError(
+                f"type_text: could not find any input/contenteditable matching {target!r}"
+            )
+
+        loc.click()
+        # Best-effort clear; ignore failures (some editors don't allow Ctrl+A).
+        try:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+        except Exception:
+            pass
         page.keyboard.insert_text(action.value)
-        return f"Typed into contenteditable {target!r}"
+        return f"Typed into contenteditable {target!r} via {used}"
 
     if isinstance(action, SelectOptionAction):
         page.get_by_label(action.label, exact=False).first.select_option(label=action.value, timeout=DEFAULT_TIMEOUT_MS)
