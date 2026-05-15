@@ -22,9 +22,10 @@ test-results/
 .playwright/
 
 # Local state
-evidence/
-sessions/
-storage/
+/evidence/
+/sessions/
+/storage/
+/backend/storage/
 *.log
 
 # Editors / OS
