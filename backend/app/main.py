@@ -1,4 +1,11 @@
+import asyncio
+import sys
 from contextlib import asynccontextmanager
+
+# Windows: Playwright launches Node as a subprocess, which requires the Proactor
+# event loop. Force it before uvicorn creates the loop.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
