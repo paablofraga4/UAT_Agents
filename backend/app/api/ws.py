@@ -1,3 +1,6 @@
+import asyncio
+import contextlib
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.agents.events import bus
@@ -14,10 +17,16 @@ async def task_events(ws: WebSocket, task_id: str) -> None:
         while True:
             event = await queue.get()
             await ws.send_json(event)
-            if event.get("type") in ("completed", "error"):
-                # Keep socket open briefly so the client receives the final frame.
-                continue
-    except WebSocketDisconnect:
+            # `completed` is always the final frame (the error path emits
+            # `error` then `completed`). Drain anything already buffered, then
+            # close so the socket and its subscription don't leak.
+            if event.get("type") == "completed":
+                while not queue.empty():
+                    await ws.send_json(queue.get_nowait())
+                break
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     finally:
         bus.unsubscribe(task_id, queue)
+        with contextlib.suppress(Exception):
+            await ws.close()

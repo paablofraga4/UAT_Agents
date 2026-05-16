@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
+from app.agents.events import bus
 from app.agents.graph import run_task
 from app.browser.session_broker import broker
 from app.models.schemas import (
@@ -15,7 +17,32 @@ from app.models.schemas import (
 from app.storage import db
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+# Hold strong refs to in-flight tasks: a bare asyncio.create_task() can be
+# garbage-collected mid-run, killing the task silently.
+_running: set[asyncio.Task] = set()
+
+
+def _spawn(task_id: str, session_id: str, instruction: str) -> None:
+    t = asyncio.create_task(run_task(task_id, session_id, instruction))
+    _running.add(t)
+
+    def _done(fut: asyncio.Task) -> None:
+        _running.discard(fut)
+        exc = fut.exception() if not fut.cancelled() else None
+        if exc is not None:
+            # run_task already handles its own errors, so reaching here means
+            # something escaped even that. Last-resort: tell the client.
+            logger.exception("run_task crashed", exc_info=exc)
+            asyncio.create_task(bus.publish(task_id, {
+                "type": "completed", "task_id": task_id,
+                "success": False,
+                "summary": f"Task crashed: {type(exc).__name__}: {exc}",
+            }))
+
+    t.add_done_callback(_done)
 
 
 @router.post("", response_model=TaskInfo)
@@ -48,8 +75,9 @@ async def create_task(req: CreateTaskRequest) -> TaskInfo:
         "summary": None,
     })
 
-    # Fire-and-forget: the WebSocket stream will carry progress.
-    asyncio.create_task(run_task(task_id, req.session_id, req.instruction))
+    # Fire-and-forget: the WebSocket stream will carry progress. The task ref
+    # is retained so it can't be GC'd mid-run.
+    _spawn(task_id, req.session_id, req.instruction)
 
     return info
 

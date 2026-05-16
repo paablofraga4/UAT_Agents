@@ -101,8 +101,15 @@ def _observe_sync(page: Page) -> dict[str, Any]:
         page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
     except PWTimeoutError:
         pass
-    url = page.url
-    title = page.title()
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+    try:
+        # Throws "Execution context was destroyed" if the page is mid-navigation.
+        title = page.title()
+    except Exception:
+        title = ""
     try:
         body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
     except Exception:
@@ -116,8 +123,11 @@ def _observe_sync(page: Page) -> dict[str, Any]:
 
 
 async def observe(session: BrowserSession, task_id: str) -> PageContext:
-    snap = await broker.run_on_page(session.session_id, _observe_sync)
-    shot = await take_screenshot(session, task_id, "observe")
+    # Hold the session lock so an observation can't interleave with an action
+    # on the same page (two tasks may share one session).
+    async with session.lock:
+        snap = await broker.run_on_page(session.session_id, _observe_sync)
+        shot = await take_screenshot(session, task_id, "observe")
     return PageContext(
         url=snap["url"],
         title=snap["title"],
@@ -326,44 +336,57 @@ def _execute_sync(page: Page, action: Action) -> str:
         return f"Uploaded {len(action.paths)} file(s) into {action.target!r}"
 
     if isinstance(action, ScrollAction):
-        # Find the nearest scrollable ancestor of an element matching `target`,
-        # falling back to window scrolling. This is what unblocks chat lists,
-        # dropdowns and infinite feeds where document.scrollingElement is fine
-        # but the actually-overflowing element is a nested div.
-        js = r"""
-        ({target, direction, amount}) => {
-            const findScrollable = (el) => {
-                while (el && el !== document.body && el !== document.documentElement) {
-                    const cs = getComputedStyle(el);
+        # Walk UP from a known element to find the nearest scrollable ancestor
+        # (O(depth), no DOM scan). The anchor is located with Playwright's
+        # selector engine — never an Array.from(querySelectorAll('*')) over
+        # thousands of nodes (that froze the worker on big SPAs).
+        scroll_js = r"""
+        (el, {direction, amount}) => {
+            const findScrollable = (node) => {
+                while (node && node !== document.body && node !== document.documentElement) {
+                    const cs = getComputedStyle(node);
                     const oy = cs.overflowY;
-                    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 4) {
-                        return el;
+                    if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight + 4) {
+                        return node;
                     }
-                    el = el.parentElement;
+                    node = node.parentElement;
                 }
                 return document.scrollingElement || document.documentElement;
             };
-            let anchor = null;
-            if (target) {
-                const t = target.toLowerCase();
-                const cands = Array.from(document.querySelectorAll('*')).filter(el => {
-                    const txt = (el.innerText || '').trim().toLowerCase();
-                    const al = (el.getAttribute && el.getAttribute('aria-label') || '').toLowerCase();
-                    return (txt && txt.includes(t) && txt.length < 200) || (al && al.includes(t));
-                });
-                anchor = cands[0] || null;
-            }
-            const container = findScrollable(anchor || document.body);
-            const before = container.scrollTop;
-            if (direction === 'bottom') container.scrollTop = container.scrollHeight;
-            else if (direction === 'top') container.scrollTop = 0;
-            else if (direction === 'up') container.scrollTop = Math.max(0, container.scrollTop - amount);
-            else container.scrollTop = container.scrollTop + amount;
-            return {moved: container.scrollTop - before, top: container.scrollTop, max: container.scrollHeight};
+            const c = findScrollable(el);
+            const before = c.scrollTop;
+            if (direction === 'bottom') c.scrollTop = c.scrollHeight;
+            else if (direction === 'top') c.scrollTop = 0;
+            else if (direction === 'up') c.scrollTop = Math.max(0, c.scrollTop - amount);
+            else c.scrollTop = c.scrollTop + amount;
+            return {moved: c.scrollTop - before, top: c.scrollTop, max: c.scrollHeight};
         }
         """
-        info = page.evaluate(js, {"target": action.target, "direction": action.direction, "amount": action.amount})
-        return f"Scrolled {action.direction} (Δ={info.get('moved')}px, top={info.get('top')}/{info.get('max')})"
+        anchor = None
+        if action.target:
+            t = action.target.strip()
+            for build in (
+                lambda: page.get_by_text(t, exact=False).first,
+                lambda: page.get_by_label(t, exact=False).first,
+                lambda: page.locator(f'[aria-label*="{t}" i]').first,
+            ):
+                try:
+                    cand = build()
+                    cand.wait_for(state="attached", timeout=1500)
+                    anchor = cand
+                    break
+                except Exception:
+                    continue
+        if anchor is None:
+            # No target (or not found): scroll the page's main scrollable.
+            anchor = page.locator("body")
+        info = anchor.evaluate(
+            scroll_js, {"direction": action.direction, "amount": action.amount}
+        )
+        return (
+            f"Scrolled {action.direction} "
+            f"(Δ={info.get('moved')}px, top={info.get('top')}/{info.get('max')})"
+        )
 
     if isinstance(action, SelectOptionAction):
         page.get_by_label(action.label, exact=False).first.select_option(label=action.value, timeout=DEFAULT_TIMEOUT_MS)

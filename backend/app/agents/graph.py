@@ -71,7 +71,18 @@ ACTION_REGISTRY = {
 
 MAX_STEPS = 25
 MAX_CONSECUTIVE_FAILURES = 3
+MAX_ACTION_REPEAT = 4  # same action chosen this many times in a row → stuck
 PAGE_TEXT_LIMIT_FOR_LLM = 5000
+
+
+def _action_sig(action_dict: dict) -> str:
+    """Stable fingerprint of an action used to detect no-progress loops:
+    the action kind plus its targeting params (ignoring free-text values like
+    typed messages, which can legitimately vary)."""
+    d = action_dict or {}
+    keys = ("action", "url", "text", "role", "name", "label", "placeholder",
+            "target", "key", "direction")
+    return "|".join(f"{k}={d.get(k)}" for k in keys if d.get(k) is not None)
 
 
 class AgentState(TypedDict, total=False):
@@ -223,6 +234,22 @@ async def node_pilot(state: AgentState) -> AgentState:
             "steps": [],
         })
 
+    # Loop guard: if the Pilot keeps choosing the SAME action (same target),
+    # it's stuck — re-observing doesn't help, abort instead of burning the
+    # remaining steps and API calls.
+    sig = _action_sig(action.model_dump())
+    recent = [_action_sig(s.get("action") or {}) for s in state["step_results"][-(MAX_ACTION_REPEAT - 1):]]
+    if len(recent) == MAX_ACTION_REPEAT - 1 and all(r == sig for r in recent) and sig:
+        state["give_up"] = True
+        state["success"] = False
+        state["summary"] = (
+            f"Stuck in a loop: the same action ({sig}) was repeated "
+            f"{MAX_ACTION_REPEAT} times without progress."
+        )
+        await _emit(state["task_id"], "log",
+                    message=f"Loop detected — aborting: {sig}", level="error")
+        return state
+
     # Execute the chosen action immediately (single-step).
     session = broker.get(state["session_id"])
     idx = len(state["step_results"])
@@ -319,4 +346,44 @@ async def run_task(task_id: str, session_id: str, instruction: str) -> AgentStat
         "step_results": [],
         "consecutive_failures": 0,
     }
-    return await graph.ainvoke(state, config={"recursion_limit": MAX_STEPS * 3 + 10})
+    try:
+        return await graph.ainvoke(
+            state, config={"recursion_limit": MAX_STEPS * 3 + 10}
+        )
+    except Exception as e:
+        # Any unhandled failure (Playwright wedged, LLM down, graph error) MUST
+        # still close the loop for the UI — otherwise the WebSocket waits on a
+        # `completed`/`error` frame that never comes and the task looks frozen.
+        err = f"{type(e).__name__}: {e}"
+        state["give_up"] = True
+        state["success"] = False
+        state["error"] = err
+        state["summary"] = f"Task aborted due to an internal error: {err}"
+        try:
+            await db.upsert_task({
+                "task_id": task_id,
+                "session_id": session_id,
+                "instruction": instruction,
+                "status": TaskStatus.FAILED.value,
+                "created_at": datetime.utcnow().isoformat(),
+                "plan_json": None,
+                "steps_json": json.dumps(state.get("step_results", []), default=str),
+                "report_path": state.get("report_path"),
+                "success": 0,
+                "summary": state["summary"],
+            })
+        except Exception:
+            pass
+        await _emit(
+            task_id, "error",
+            message=err,
+            summary=state["summary"],
+            success=False,
+        )
+        await _emit(
+            task_id, "completed",
+            success=False,
+            summary=state["summary"],
+            report_path=state.get("report_path"),
+        )
+        return state
