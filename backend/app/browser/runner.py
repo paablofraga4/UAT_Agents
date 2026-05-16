@@ -43,27 +43,34 @@ DEFAULT_TIMEOUT_MS = 8000
 SETTLE_MS = 800
 SETTLE_AFTER = {"click_text", "click_role", "goto", "press_key", "select_option", "upload_file", "scroll"}
 MAX_VISIBLE_TEXT = 6000
-MAX_INTERACTIVE = 60
+MAX_INTERACTIVE = 90  # nav is guaranteed inside this; content fills the rest
 
 
 class ActionExecutionError(Exception):
     pass
 
 
-# Single observation pass. Critical design point: after a long session the
-# SPA DOM grows huge (infinite-scrolled feeds, panels left mounted by previous
-# tasks). Reading document.body.innerText from the top and truncating means the
-# content that JUST loaded (notifications, the conversation, the result list)
-# falls off the cliff and the Pilot goes blind — that's the "decays over a long
-# session" failure. So we scope text + interactives to the MAIN content region
-# and prioritise what's in/near the viewport, and we surface leftover modal
-# overlays so the Pilot can dismiss them.
+# Single observation pass.
+#
+# Two hard requirements learned the hard way:
+#  1. After a long session the SPA DOM grows huge (infinite-scrolled feeds,
+#     panels left mounted). Reading document.body.innerText from the top and
+#     truncating pushes the content that JUST loaded past the cliff and the
+#     Pilot goes blind — so the BULK TEXT is scoped to the MAIN content region.
+#  2. BUT the primary navigation (Home/Network/Jobs/Messaging/Notifications/Me)
+#     lives in <header>/<nav>, OUTSIDE <main>. If we only report <main>, the
+#     agent can no longer move between sections — it can't even SEE the
+#     Notifications link. So the global nav is ALWAYS captured separately and
+#     GUARANTEED into the observation (both as a NAV summary line in the text
+#     and as reserved slots in interactive_elements), regardless of how much
+#     content there is.
 _OBSERVE_JS = r"""
 ({maxText, maxInter}) => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+
     const pickRoot = () => {
         const m = document.querySelector('main, [role="main"]');
         if (m && m.innerText && m.innerText.trim().length > 40) return m;
-        // largest scrollable region as a fallback
         let best = document.body, bestArea = 0;
         document.querySelectorAll('div,section').forEach(el => {
             const cs = getComputedStyle(el);
@@ -77,15 +84,31 @@ _OBSERVE_JS = r"""
     };
     const root = pickRoot();
 
-    // Open dialogs / modal overlays (often leftovers from a previous task that
-    // block the current view). Reported so the Pilot knows to close them.
+    // --- Primary navigation: ALWAYS captured, never truncated away ----------
+    const navScopes = document.querySelectorAll(
+        'header, nav, [role="navigation"], [role="banner"]'
+    );
+    const navItems = [];
+    const navSeen = new Set();
+    navScopes.forEach(scope => {
+        scope.querySelectorAll('a,button,[role=link],[role=button],[role=tab]').forEach(el => {
+            const lbl = clean(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'));
+            if (!lbl) return;
+            const k = el.tagName.toLowerCase() + '::' + lbl;
+            if (navSeen.has(k)) return;
+            navSeen.add(k);
+            navItems.push(`[nav ${el.tagName.toLowerCase()}] ${lbl}`);
+        });
+    });
+    const navList = navItems.slice(0, 30);
+
+    // --- Open dialogs / modal overlays (often leftovers from prior tasks) ---
     const overlays = [];
     document.querySelectorAll('[role="dialog"],[aria-modal="true"]').forEach(d => {
         const r = d.getBoundingClientRect();
         if (r.width > 80 && r.height > 60) {
-            const lbl = (d.getAttribute('aria-label') ||
-                (d.querySelector('h1,h2,h3') || {}).innerText || 'dialog').trim().slice(0, 80);
-            overlays.push(lbl);
+            overlays.push(clean(d.getAttribute('aria-label') ||
+                (d.querySelector('h1,h2,h3') || {}).innerText || 'dialog'));
         }
     });
 
@@ -96,11 +119,11 @@ _OBSERVE_JS = r"""
             && r.width > 0 && r.height > 0;
     };
 
+    // --- Content interactive elements (main first, viewport-prioritised) ----
     const out = [];
-    const seen = new Set();
+    const seen = new Set(navSeen);
     const push = (kind, label, prio) => {
-        if (!label) return;
-        const t = String(label).trim().slice(0, 80);
+        const t = clean(label);
         if (!t) return;
         const key = kind + '::' + t;
         if (seen.has(key)) return;
@@ -122,18 +145,29 @@ _OBSERVE_JS = r"""
             push(el.tagName.toLowerCase(), label, baseProb + (inViewport(el) ? 0 : 1));
         });
     };
-    // Priority order: content root first, then the rest of the page (nav/chrome).
     collect(root, 0);
     if (root !== document.body) collect(document.body, 4);
     out.sort((a, b) => a.p - b.p);
-    const interactive = out.slice(0, maxInter).map(o => o.s);
+
+    // Nav is GUARANTEED; content fills whatever budget remains.
+    const interactive = navList.concat(
+        out.slice(0, Math.max(0, maxInter - navList.length)).map(o => o.s)
+    );
 
     let text = (root.innerText || document.body.innerText || '').trim();
     if (text.length > maxText) text = text.slice(0, maxText) + '…[truncated]';
-    const prefix = overlays.length
-        ? `[OPEN DIALOG/OVERLAY: ${overlays.join(' | ')} — close it (press Escape or click its X/Close) before continuing]\n\n`
+
+    const navSummary = navList.length
+        ? `[PRIMARY NAV — use these to switch sections: ${
+            navList.map(s => s.replace(/^\[nav [a-z]+\] /, '')).join(' | ')}]\n`
         : '';
-    return {visible_text: prefix + text, interactive_elements: interactive};
+    const overlayLine = overlays.length
+        ? `[OPEN DIALOG/OVERLAY: ${overlays.join(' | ')} — close it (press Escape or click its X/Close) before continuing]\n`
+        : '';
+    return {
+        visible_text: overlayLine + navSummary + (navSummary ? '\n' : '') + text,
+        interactive_elements: interactive,
+    };
 }
 """
 
@@ -205,8 +239,9 @@ def _try_click(page: Page, locator_builders: list[tuple[str, Any]], per_try_ms: 
     first one that succeeds. Each attempt: wait for visibility, then click. If the
     element is disabled (e.g. Send button before composer registers input), wait
     briefly for it to become enabled."""
-    last_err: Exception | None = None
+    tried: list[str] = []
     for label, build in locator_builders:
+        tried.append(label)
         try:
             loc = build()
             loc.wait_for(state="visible", timeout=per_try_ms)
@@ -217,10 +252,15 @@ def _try_click(page: Page, locator_builders: list[tuple[str, Any]], per_try_ms: 
                 # event from a contenteditable). Re-poll for enabled state.
                 loc.click(timeout=DEFAULT_TIMEOUT_MS, force=False)
             return label
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
-    raise last_err or ActionExecutionError("no locator matched")
+    # A clear, actionable message — "Timeout 1500ms exceeded" alone told us
+    # nothing about WHAT was searched for.
+    raise ActionExecutionError(
+        "no clickable element matched. Tried: " + "; ".join(tried)
+        + ". The target text/role is probably not on the page — re-observe "
+        "(extract_context), check the PRIMARY NAV summary, or scroll."
+    )
 
 
 def _click_strategies(page: Page, name: str, role: str | None = None) -> list[tuple[str, Any]]:
