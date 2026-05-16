@@ -307,15 +307,62 @@ def route_after_pilot(state: AgentState) -> str:
     return "observer"
 
 
+def _failure_reason(state: AgentState) -> dict[str, Any]:
+    """Machine-level explanation of why the run ended, separate from the LLM's
+    prose summary. This is what tells us WHY a task that used to work now fails."""
+    steps = state.get("step_results", [])
+    failed = [s for s in steps if s.get("status") == "failed"]
+    last_step = steps[-1] if steps else None
+    if state.get("success"):
+        category = "success"
+    elif state.get("error"):
+        # Set by node_pilot stop-conditions or the run_task crash handler.
+        err = state["error"]
+        if "max steps" in err.lower():
+            category = "exhausted_max_steps"
+        elif "consecutive failures" in err.lower():
+            category = "too_many_failures"
+        elif "loop" in err.lower():
+            category = "stuck_loop"
+        else:
+            category = "internal_error"
+    elif state.get("give_up"):
+        category = "pilot_gave_up"
+    else:
+        category = "unknown"
+    return {
+        "category": category,
+        "machine_reason": state.get("error"),
+        "steps_attempted": len(steps),
+        "steps_failed": len(failed),
+        "last_step": last_step,
+        "step_errors": [
+            {"index": s.get("index"), "action": s.get("action"), "error": s.get("error")}
+            for s in failed
+        ],
+    }
+
+
 async def node_report(state: AgentState) -> AgentState:
     await _save_task(state, TaskStatus.REPORTING)
     await _emit(state["task_id"], "log", message="Reporter: writing evidence report…")
+
+    ctx = state.get("page_context") or {}
+    diagnostics = _failure_reason(state)
+    final_state = {
+        "final_url": ctx.get("url"),
+        "final_title": ctx.get("title"),
+        "what_the_agent_last_saw": (ctx.get("visible_text") or "")[:1500],
+        "interactive_elements_seen": (ctx.get("interactive_elements") or [])[:40],
+    }
 
     user_msg = json.dumps({
         "instruction": state["instruction"],
         "interpreted_task": state.get("interpreted_task"),
         "success": state.get("success"),
         "summary": state.get("summary"),
+        "diagnostics": diagnostics,
+        "final_state": final_state,
         "steps": state.get("step_results", []),
     }, ensure_ascii=False, default=str)
     md = await llm.chat_text(prompts.REPORTER_SYSTEM, user_msg)
@@ -324,6 +371,17 @@ async def node_report(state: AgentState) -> AgentState:
     report_path = folder / "report.md"
     write_text(report_path, md)
     write_json(folder / "steps.json", state.get("step_results", []))
+    # Full machine-readable diagnostics for debugging regressions.
+    write_json(folder / "debug.json", {
+        "instruction": state["instruction"],
+        "interpreted_task": state.get("interpreted_task"),
+        "success": state.get("success"),
+        "summary": state.get("summary"),
+        "diagnostics": diagnostics,
+        "final_page_context": ctx,
+        "act_trace": state.get("act_trace", []),
+        "step_results": state.get("step_results", []),
+    })
 
     state["report_path"] = relative_to_evidence(report_path)
 

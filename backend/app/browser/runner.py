@@ -50,33 +50,90 @@ class ActionExecutionError(Exception):
     pass
 
 
-_INTERACTIVE_JS = r"""
-() => {
+# Single observation pass. Critical design point: after a long session the
+# SPA DOM grows huge (infinite-scrolled feeds, panels left mounted by previous
+# tasks). Reading document.body.innerText from the top and truncating means the
+# content that JUST loaded (notifications, the conversation, the result list)
+# falls off the cliff and the Pilot goes blind — that's the "decays over a long
+# session" failure. So we scope text + interactives to the MAIN content region
+# and prioritise what's in/near the viewport, and we surface leftover modal
+# overlays so the Pilot can dismiss them.
+_OBSERVE_JS = r"""
+({maxText, maxInter}) => {
+    const pickRoot = () => {
+        const m = document.querySelector('main, [role="main"]');
+        if (m && m.innerText && m.innerText.trim().length > 40) return m;
+        // largest scrollable region as a fallback
+        let best = document.body, bestArea = 0;
+        document.querySelectorAll('div,section').forEach(el => {
+            const cs = getComputedStyle(el);
+            if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                && el.scrollHeight > el.clientHeight + 8) {
+                const a = el.clientWidth * el.clientHeight;
+                if (a > bestArea) { bestArea = a; best = el; }
+            }
+        });
+        return best || document.body;
+    };
+    const root = pickRoot();
+
+    // Open dialogs / modal overlays (often leftovers from a previous task that
+    // block the current view). Reported so the Pilot knows to close them.
+    const overlays = [];
+    document.querySelectorAll('[role="dialog"],[aria-modal="true"]').forEach(d => {
+        const r = d.getBoundingClientRect();
+        if (r.width > 80 && r.height > 60) {
+            const lbl = (d.getAttribute('aria-label') ||
+                (d.querySelector('h1,h2,h3') || {}).innerText || 'dialog').trim().slice(0, 80);
+            overlays.push(lbl);
+        }
+    });
+
+    const vh = window.innerHeight || 800, vw = window.innerWidth || 1280;
+    const inViewport = (el) => {
+        const r = el.getBoundingClientRect();
+        return r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw
+            && r.width > 0 && r.height > 0;
+    };
+
     const out = [];
     const seen = new Set();
-    const push = (kind, label) => {
+    const push = (kind, label, prio) => {
         if (!label) return;
-        const t = label.trim().slice(0, 80);
+        const t = String(label).trim().slice(0, 80);
         if (!t) return;
         const key = kind + '::' + t;
         if (seen.has(key)) return;
         seen.add(key);
-        out.push(`[${kind}] ${t}`);
+        out.push({s: `[${kind}] ${t}`, p: prio});
     };
-    document.querySelectorAll('button, a, [role=button], [role=link], [role=tab]').forEach(el => {
-        push(el.tagName.toLowerCase(), el.innerText || el.getAttribute('aria-label'));
-    });
-    document.querySelectorAll('input, textarea, select').forEach(el => {
-        const id = el.getAttribute('id');
-        let label = '';
-        if (id) {
-            const l = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-            if (l) label = l.innerText;
-        }
-        label = label || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || el.tagName;
-        push(el.tagName.toLowerCase(), label);
-    });
-    return out;
+    const collect = (scope, baseProb) => {
+        scope.querySelectorAll('button,a,[role=button],[role=link],[role=tab],[role=menuitem]').forEach(el => {
+            push(el.tagName.toLowerCase(),
+                 el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'),
+                 baseProb + (inViewport(el) ? 0 : 1));
+        });
+        scope.querySelectorAll('input,textarea,select').forEach(el => {
+            const id = el.getAttribute('id');
+            let label = '';
+            if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l) label = l.innerText; }
+            label = label || el.getAttribute('aria-label') || el.getAttribute('placeholder')
+                  || el.getAttribute('name') || el.tagName;
+            push(el.tagName.toLowerCase(), label, baseProb + (inViewport(el) ? 0 : 1));
+        });
+    };
+    // Priority order: content root first, then the rest of the page (nav/chrome).
+    collect(root, 0);
+    if (root !== document.body) collect(document.body, 4);
+    out.sort((a, b) => a.p - b.p);
+    const interactive = out.slice(0, maxInter).map(o => o.s);
+
+    let text = (root.innerText || document.body.innerText || '').trim();
+    if (text.length > maxText) text = text.slice(0, maxText) + '…[truncated]';
+    const prefix = overlays.length
+        ? `[OPEN DIALOG/OVERLAY: ${overlays.join(' | ')} — close it (press Escape or click its X/Close) before continuing]\n\n`
+        : '';
+    return {visible_text: prefix + text, interactive_elements: interactive};
 }
 """
 
@@ -101,6 +158,12 @@ def _observe_sync(page: Page) -> dict[str, Any]:
         page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
     except PWTimeoutError:
         pass
+    # Best-effort: let async content (notifications, feeds) settle. Bounded so a
+    # never-idle SPA (LinkedIn polls forever) doesn't stall the observation.
+    try:
+        page.wait_for_load_state("networkidle", timeout=2500)
+    except PWTimeoutError:
+        pass
     try:
         url = page.url
     except Exception:
@@ -111,15 +174,15 @@ def _observe_sync(page: Page) -> dict[str, Any]:
     except Exception:
         title = ""
     try:
-        body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        snap = page.evaluate(_OBSERVE_JS, {"maxText": MAX_VISIBLE_TEXT, "maxInter": MAX_INTERACTIVE}) or {}
     except Exception:
-        body = ""
-    body = body[:MAX_VISIBLE_TEXT]
-    try:
-        interactive = page.evaluate(_INTERACTIVE_JS) or []
-    except Exception:
-        interactive = []
-    return {"url": url, "title": title, "visible_text": body, "interactive_elements": interactive[:MAX_INTERACTIVE]}
+        snap = {}
+    return {
+        "url": url,
+        "title": title,
+        "visible_text": snap.get("visible_text") or "",
+        "interactive_elements": snap.get("interactive_elements") or [],
+    }
 
 
 async def observe(session: BrowserSession, task_id: str) -> PageContext:
