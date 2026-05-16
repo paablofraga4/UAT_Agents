@@ -57,13 +57,13 @@ class ActionExecutionError(Exception):
 #     panels left mounted). Reading document.body.innerText from the top and
 #     truncating pushes the content that JUST loaded past the cliff and the
 #     Pilot goes blind — so the BULK TEXT is scoped to the MAIN content region.
-#  2. BUT the primary navigation (Home/Network/Jobs/Messaging/Notifications/Me)
-#     lives in <header>/<nav>, OUTSIDE <main>. If we only report <main>, the
-#     agent can no longer move between sections — it can't even SEE the
-#     Notifications link. So the global nav is ALWAYS captured separately and
-#     GUARANTEED into the observation (both as a NAV summary line in the text
-#     and as reserved slots in interactive_elements), regardless of how much
-#     content there is.
+#  2. BUT the primary navigation (persistent top bar / side rail / tab strip)
+#     lives OUTSIDE <main>. If we only report <main>, the agent can no longer
+#     move between sections — it can't even SEE the section links. So app
+#     chrome is detected app-agnostically (semantic landmarks OR fixed/sticky
+#     containers — works whether or not the product uses <header>/<nav>) and
+#     GUARANTEED into the observation (a NAV summary line in the text plus
+#     reserved slots in interactive_elements), regardless of content volume.
 _OBSERVE_JS = r"""
 ({maxText, maxInter}) => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
@@ -84,23 +84,38 @@ _OBSERVE_JS = r"""
     };
     const root = pickRoot();
 
-    // --- Primary navigation: ALWAYS captured, never truncated away ----------
-    const navScopes = document.querySelectorAll(
-        'header, nav, [role="navigation"], [role="banner"]'
-    );
-    const navItems = [];
-    const navSeen = new Set();
-    navScopes.forEach(scope => {
-        scope.querySelectorAll('a,button,[role=link],[role=button],[role=tab]').forEach(el => {
-            const lbl = clean(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'));
-            if (!lbl) return;
-            const k = el.tagName.toLowerCase() + '::' + lbl;
-            if (navSeen.has(k)) return;
-            navSeen.add(k);
-            navItems.push(`[nav ${el.tagName.toLowerCase()}] ${lbl}`);
-        });
-    });
-    const navList = navItems.slice(0, 30);
+    // --- "Is this app chrome (persistent nav/topbar/side rail)?" -----------
+    // App-agnostic on purpose: many SPAs (Slack, Salesforce, internal ERPs)
+    // do NOT use semantic <header>/<nav>. So an element counts as chrome if it
+    // sits inside EITHER (a) a semantic landmark, OR (b) a position
+    // fixed/sticky container — the universal structural pattern for top bars,
+    // side rails and action bars across virtually every web product.
+    const LANDMARK = 'header,nav,aside,[role="navigation"],[role="banner"],[role="complementary"]';
+    const chromeCache = new Map();
+    const isChrome = (el) => {
+        let node = el, depth = 0;
+        while (node && node !== document.body && depth < 10) {
+            if (chromeCache.has(node)) return chromeCache.get(node);
+            let verdict = false;
+            if (node.matches && node.matches(LANDMARK)) {
+                verdict = true;
+            } else {
+                const cs = getComputedStyle(node);
+                if (cs.position === 'fixed' || cs.position === 'sticky') {
+                    const r = node.getBoundingClientRect();
+                    const W = window.innerWidth || 1280, H = window.innerHeight || 800;
+                    // Ignore full-page sticky wrappers (overlays/scroll hacks):
+                    // real chrome occupies a strip, not ~the whole viewport.
+                    const coversAll = r.width > W * 0.92 && r.height > H * 0.85;
+                    verdict = !coversAll;
+                }
+            }
+            if (verdict) { chromeCache.set(el, true); return true; }
+            node = node.parentElement; depth++;
+        }
+        chromeCache.set(el, false);
+        return false;
+    };
 
     // --- Open dialogs / modal overlays (often leftovers from prior tasks) ---
     const overlays = [];
@@ -119,35 +134,40 @@ _OBSERVE_JS = r"""
             && r.width > 0 && r.height > 0;
     };
 
-    // --- Content interactive elements (main first, viewport-prioritised) ----
+    // --- Single classification pass over every actionable element ----------
+    // Each is either CHROME (persistent nav — guaranteed into the output) or
+    // CONTENT (prioritised: inside the main root + in the viewport first).
+    const navItems = [];
     const out = [];
-    const seen = new Set(navSeen);
-    const push = (kind, label, prio) => {
-        const t = clean(label);
-        if (!t) return;
-        const key = kind + '::' + t;
-        if (seen.has(key)) return;
-        seen.add(key);
-        out.push({s: `[${kind}] ${t}`, p: prio});
-    };
-    const collect = (scope, baseProb) => {
-        scope.querySelectorAll('button,a,[role=button],[role=link],[role=tab],[role=menuitem]').forEach(el => {
-            push(el.tagName.toLowerCase(),
-                 el.innerText || el.getAttribute('aria-label') || el.getAttribute('title'),
-                 baseProb + (inViewport(el) ? 0 : 1));
-        });
-        scope.querySelectorAll('input,textarea,select').forEach(el => {
+    const seen = new Set();
+    const labelFor = (el) => {
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
             const id = el.getAttribute('id');
             let label = '';
             if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l) label = l.innerText; }
-            label = label || el.getAttribute('aria-label') || el.getAttribute('placeholder')
-                  || el.getAttribute('name') || el.tagName;
-            push(el.tagName.toLowerCase(), label, baseProb + (inViewport(el) ? 0 : 1));
-        });
+            return label || el.getAttribute('aria-label') || el.getAttribute('placeholder')
+                 || el.getAttribute('name') || tag;
+        }
+        return el.innerText || el.getAttribute('aria-label') || el.getAttribute('title');
     };
-    collect(root, 0);
-    if (root !== document.body) collect(document.body, 4);
+    const ACTIONABLE = 'button,a,input,textarea,select,[role=button],[role=link],[role=tab],[role=menuitem]';
+    document.querySelectorAll(ACTIONABLE).forEach(el => {
+        const tag = el.tagName.toLowerCase();
+        const lbl = clean(labelFor(el));
+        if (!lbl) return;
+        const key = tag + '::' + lbl;
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (isChrome(el)) {
+            navItems.push(`[nav ${tag}] ${lbl}`);
+        } else {
+            const prio = (root.contains(el) ? 0 : 2) + (inViewport(el) ? 0 : 1);
+            out.push({s: `[${tag}] ${lbl}`, p: prio});
+        }
+    });
     out.sort((a, b) => a.p - b.p);
+    const navList = navItems.slice(0, 35);
 
     // Nav is GUARANTEED; content fills whatever budget remains.
     const interactive = navList.concat(

@@ -32,11 +32,13 @@ ALLOWED actions (use these exact `action` values; never invent new ones):
 
 Operating rules:
 - NAVIGATION: the PAGE CONTEXT begins with a `[PRIMARY NAV — use these to
-  switch sections: ...]` line listing the app's top-level navigation
-  (Home/Network/Jobs/Messaging/Notifications/Me, etc.). To go to a section
-  named in the instruction, click_role/click_text the matching NAV entry —
-  do NOT guess a similarly-named button in the page body (e.g. clicking
-  "Nuevas publicaciones" on the feed is NOT the same as "Notificaciones").
+  switch sections: ...]` line listing THIS app's persistent top-level
+  navigation (whatever the product is — a SaaS sidebar, an ERP top bar, a
+  social app tab strip…). To go to a section named in the instruction, click
+  the matching NAV entry. Do NOT guess a similarly-named control in the page
+  body: a body element that merely sounds like the target section is almost
+  never the navigation entry (e.g. a "new items" refresh button in a content
+  feed is not the "Notifications"/section link).
 - If the context starts with `[OPEN DIALOG/OVERLAY: ...]`, a modal is blocking
   the view (often left over from earlier). Close it first: `press_key Escape`
   or click its X/Close/"Descartar" — then re-observe.
