@@ -85,6 +85,17 @@ def _action_sig(action_dict: dict) -> str:
     return "|".join(f"{k}={d.get(k)}" for k in keys if d.get(k) is not None)
 
 
+def _page_fp(ctx: dict) -> str:
+    """Coarse fingerprint of the page the Pilot is acting on. Includes the
+    interactive-element labels so that a button flipping Connect→Pending (or a
+    card leaving the list) counts as progress even if it happens past the
+    visible_text truncation window."""
+    ctx = ctx or {}
+    text = (ctx.get("visible_text") or "")[:1500]
+    inter = "\x1f".join(ctx.get("interactive_elements") or [])
+    return f"{ctx.get('url', '')}\x1f{hash(text)}\x1f{hash(inter)}"
+
+
 class AgentState(TypedDict, total=False):
     task_id: str
     session_id: str
@@ -92,6 +103,7 @@ class AgentState(TypedDict, total=False):
     page_context: dict
     interpreted_task: str
     step_results: list[dict]
+    act_trace: list[dict]
     consecutive_failures: int
     done: bool
     give_up: bool
@@ -234,21 +246,29 @@ async def node_pilot(state: AgentState) -> AgentState:
             "steps": [],
         })
 
-    # Loop guard: if the Pilot keeps choosing the SAME action (same target),
-    # it's stuck — re-observing doesn't help, abort instead of burning the
-    # remaining steps and API calls.
+    # Loop guard: only a TRUE no-progress loop, i.e. the same action chosen
+    # against an UNCHANGED page. Repeating "click Connect" on a list that keeps
+    # changing (each click flips a button / drops a card) is legitimate
+    # progress and must NOT trip this.
     sig = _action_sig(action.model_dump())
-    recent = [_action_sig(s.get("action") or {}) for s in state["step_results"][-(MAX_ACTION_REPEAT - 1):]]
-    if len(recent) == MAX_ACTION_REPEAT - 1 and all(r == sig for r in recent) and sig:
+    fp = _page_fp(state.get("page_context") or {})
+    trace = state.setdefault("act_trace", [])
+    recent = trace[-(MAX_ACTION_REPEAT - 1):]
+    if (
+        sig
+        and len(recent) == MAX_ACTION_REPEAT - 1
+        and all(t.get("sig") == sig and t.get("fp") == fp for t in recent)
+    ):
         state["give_up"] = True
         state["success"] = False
         state["summary"] = (
-            f"Stuck in a loop: the same action ({sig}) was repeated "
-            f"{MAX_ACTION_REPEAT} times without progress."
+            f"Stuck in a loop: action ({sig}) repeated {MAX_ACTION_REPEAT} "
+            f"times with no change to the page."
         )
         await _emit(state["task_id"], "log",
                     message=f"Loop detected — aborting: {sig}", level="error")
         return state
+    trace.append({"sig": sig, "fp": fp})
 
     # Execute the chosen action immediately (single-step).
     session = broker.get(state["session_id"])
