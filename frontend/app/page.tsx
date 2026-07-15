@@ -13,8 +13,9 @@ import {
   confirmLogin,
   createSession,
   createTask,
+  type TaskMode,
 } from "@/lib/api";
-import { openTaskSocket, type AgentEvent } from "@/lib/ws";
+import { openTaskSocket, type AgentEvent, type TaskSocket } from "@/lib/ws";
 
 type Step = {
   index: number;
@@ -37,7 +38,7 @@ export default function Page() {
   const [runStatus, setRunStatus] = useState<"idle" | "running" | "success" | "failed">("idle");
   const [summary, setSummary] = useState<string | null>(null);
   const [reportPath, setReportPath] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef = useRef<TaskSocket | null>(null);
 
   const log = (text: string, kind: LogEntry["kind"] = "info") =>
     setLogs((prev) => [...prev, { ts: now(), text, kind }]);
@@ -48,7 +49,7 @@ export default function Page() {
       const s = await createSession(url);
       setSessionId(s.session_id);
       setSessionStatus(s.status);
-      log(`Session ${s.session_id} created — log in manually in the Chromium window.`);
+      log(`Session ${s.session_id} created — log in to the target app in the live view below.`);
     } catch (e: any) {
       log(`Failed to create session: ${e.message}`, "error");
     }
@@ -67,6 +68,8 @@ export default function Page() {
 
   const handleClose = useCallback(async () => {
     if (!sessionId) return;
+    wsRef.current?.close();
+    wsRef.current = null;
     await closeSession(sessionId);
     setSessionId(null);
     setSessionStatus("idle");
@@ -79,18 +82,18 @@ export default function Page() {
     log("Session closed.");
   }, [sessionId]);
 
-  const handleRun = useCallback(async (instruction: string) => {
+  const handleRun = useCallback(async (instruction: string, mode: TaskMode) => {
     if (!sessionId) return;
     setSteps([]);
     setInterpretedTask(null);
     setSummary(null);
     setReportPath(null);
     setRunStatus("running");
-    log(`Submitting task: ${instruction}`);
+    log(`Submitting ${mode === "test_form" ? "form test" : "task"}: ${instruction}`);
 
     let task;
     try {
-      task = await createTask(sessionId, instruction);
+      task = await createTask(sessionId, instruction, mode);
     } catch (e: any) {
       log(`Task creation failed: ${e.message}`, "error");
       setRunStatus("failed");
@@ -98,8 +101,7 @@ export default function Page() {
     }
 
     wsRef.current?.close();
-    const ws = openTaskSocket(task.task_id, handleEvent);
-    wsRef.current = ws;
+    wsRef.current = openTaskSocket(task.task_id, handleEvent);
   }, [sessionId]);
 
   const handleEvent = useCallback((e: AgentEvent) => {
@@ -180,7 +182,7 @@ export default function Page() {
       />
       <div className="flex gap-3 flex-1 min-h-0">
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <BrowserView screenshotPath={screenshotPath} />
+          <BrowserView sessionId={sessionId} screenshotPath={screenshotPath} />
           <CommandBox disabled={!canRun} onSubmit={handleRun} />
           <ReportSection status={runStatus} summary={summary} reportPath={reportPath} />
         </div>

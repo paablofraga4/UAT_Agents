@@ -272,10 +272,12 @@ async def node_pilot(state: AgentState) -> AgentState:
     max_steps = _max_steps(state)
     if len(state["step_results"]) >= max_steps:
         state["give_up"] = True
+        state["success"] = False
         state["error"] = f"Reached max steps ({max_steps})"
         return state
     if state["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES:
         state["give_up"] = True
+        state["success"] = False
         state["error"] = f"{MAX_CONSECUTIVE_FAILURES} consecutive failures"
         return state
 
@@ -349,6 +351,7 @@ async def node_pilot(state: AgentState) -> AgentState:
     ):
         state["give_up"] = True
         state["success"] = False
+        state["error"] = f"Stuck in a loop: {sig}"
         state["summary"] = (
             f"Stuck in a loop: action ({sig}) repeated {MAX_ACTION_REPEAT} "
             f"times with no change to the page."
