@@ -1,7 +1,8 @@
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.api.deps import require_token
 from app.browser.session_broker import broker
 from app.models.schemas import (
     CreateSessionRequest,
@@ -11,7 +12,9 @@ from app.models.schemas import (
 from app.storage import db
 
 
-router = APIRouter(prefix="/sessions", tags=["sessions"])
+router = APIRouter(
+    prefix="/sessions", tags=["sessions"], dependencies=[Depends(require_token)]
+)
 
 
 @router.post("", response_model=SessionInfo)

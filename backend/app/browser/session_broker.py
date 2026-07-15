@@ -20,11 +20,13 @@ issues and works on every OS).
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import uuid
 from concurrent.futures import Future
+from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import Queue
 from typing import Any, Callable, Optional
 
@@ -76,10 +78,13 @@ class _SessionWorker:
     def _loop(self) -> None:
         try:
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
-                headless=settings.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            launch_kwargs: dict[str, Any] = {
+                "headless": settings.headless,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            if settings.browser_executable_path:
+                launch_kwargs["executable_path"] = settings.browser_executable_path
+            self._browser = self._pw.chromium.launch(**launch_kwargs)
         except BaseException as e:  # noqa: BLE001 - surface launch failures to caller
             self._start_error = e
             self._started.set()
@@ -146,6 +151,9 @@ class BrowserSession:
     worker: _SessionWorker
     last_screenshot: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # One agent task at a time per session: two pilots interleaving actions on
+    # the same page is guaranteed incoherence. Set by the tasks API.
+    active_task_id: Optional[str] = None
 
     @property
     def context(self) -> BrowserContext:
@@ -190,7 +198,7 @@ class SessionBroker:
             session_id=session_id,
             url=url,
             status=SessionStatus.WAITING_LOGIN,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             worker=worker,
         )
         self._sessions[session_id] = session
@@ -201,14 +209,27 @@ class SessionBroker:
             raise KeyError(f"Unknown session {session_id}")
         return self._sessions[session_id]
 
+    def _storage_state_path(self, session_id: str) -> "Path":
+        return settings.sessions_dir / f"{session_id}.json"
+
     async def confirm_login(self, session_id: str) -> None:
         session = self.get(session_id)
-        storage_state_path = settings.sessions_dir / f"{session_id}.json"
 
-        def _persist() -> None:
-            session.context.storage_state(path=str(storage_state_path))
+        # storage_state is cookies/tokens in plaintext — only persist it when
+        # explicitly enabled, with owner-only permissions, and delete it when
+        # the session closes.
+        if settings.persist_storage_state:
+            storage_state_path = self._storage_state_path(session_id)
 
-        await session.worker.run(_persist)
+            def _persist() -> None:
+                session.context.storage_state(path=str(storage_state_path))
+
+            await session.worker.run(_persist)
+            try:
+                os.chmod(storage_state_path, 0o600)
+            except OSError:
+                pass
+
         session.status = SessionStatus.AUTHENTICATED
 
     async def close_session(self, session_id: str) -> None:
@@ -229,6 +250,12 @@ class SessionBroker:
 
         session.worker.shutdown()
         session.status = SessionStatus.CLOSED
+
+        # Credentials at rest live no longer than the session.
+        try:
+            self._storage_state_path(session_id).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     async def run_on_page(self, session_id: str, fn: Callable[[Page], Any], *, timeout: float = DEFAULT_CALL_TIMEOUT_S) -> Any:
         """Run a sync Playwright callable against this session's page."""

@@ -12,14 +12,20 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.sync_api import Page, TimeoutError as PWTimeoutError
 
 from app.browser.session_broker import BrowserSession, broker
+from app.config import settings
 from app.models.schemas import (
     Action,
+    AssertFieldValueAction,
     AssertTextAction,
+    AssertUrlContainsAction,
+    ClickElementAction,
     ClickRoleAction,
     ClickTextAction,
     ExtractContextAction,
@@ -41,7 +47,7 @@ from app.storage.evidence import screenshot_path
 
 DEFAULT_TIMEOUT_MS = 8000
 SETTLE_MS = 800
-SETTLE_AFTER = {"click_text", "click_role", "goto", "press_key", "select_option", "upload_file", "scroll"}
+SETTLE_AFTER = {"click_text", "click_role", "click_element", "goto", "press_key", "select_option", "upload_file", "scroll"}
 MAX_VISIBLE_TEXT = 6000
 MAX_INTERACTIVE = 90  # nav is guaranteed inside this; content fills the rest
 
@@ -137,6 +143,12 @@ _OBSERVE_JS = r"""
     // --- Single classification pass over every actionable element ----------
     // Each is either CHROME (persistent nav — guaranteed into the output) or
     // CONTENT (prioritised: inside the main root + in the viewport first).
+    // Every reported element is stamped with data-uat-id=N and listed as
+    // `[N][tag] label`, so the agent can click it by id (click_element) with
+    // zero locator guessing. Stale ids from earlier observations are cleared
+    // first — an id must always refer to THIS snapshot.
+    document.querySelectorAll('[data-uat-id]').forEach(el => el.removeAttribute('data-uat-id'));
+    let uid = 0;
     const navItems = [];
     const out = [];
     const seen = new Set();
@@ -159,11 +171,13 @@ _OBSERVE_JS = r"""
         const key = tag + '::' + lbl;
         if (seen.has(key)) return;
         seen.add(key);
+        const id = uid++;
+        el.setAttribute('data-uat-id', String(id));
         if (isChrome(el)) {
-            navItems.push(`[nav ${tag}] ${lbl}`);
+            navItems.push(`[${id}][nav ${tag}] ${lbl}`);
         } else {
             const prio = (root.contains(el) ? 0 : 2) + (inViewport(el) ? 0 : 1);
-            out.push({s: `[${tag}] ${lbl}`, p: prio});
+            out.push({s: `[${id}][${tag}] ${lbl}`, p: prio});
         }
     });
     out.sort((a, b) => a.p - b.p);
@@ -179,7 +193,7 @@ _OBSERVE_JS = r"""
 
     const navSummary = navList.length
         ? `[PRIMARY NAV — use these to switch sections: ${
-            navList.map(s => s.replace(/^\[nav [a-z]+\] /, '')).join(' | ')}]\n`
+            navList.map(s => s.replace(/^\[\d+\]\[nav [a-z]+\] /, '')).join(' | ')}]\n`
         : '';
     const overlayLine = overlays.length
         ? `[OPEN DIALOG/OVERLAY: ${overlays.join(' | ')} — close it (press Escape or click its X/Close) before continuing]\n`
@@ -355,6 +369,45 @@ def _resolve_file_input(page: Page, target: str):
     raise ActionExecutionError(f"upload_file: no <input type=file> found for {target!r}")
 
 
+def _check_domain_allowed(url: str) -> None:
+    """Enforce the goto() domain allowlist. Empty list = unrestricted."""
+    allowed = settings.allowed_domain_list()
+    if not allowed:
+        return
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == d or host.endswith("." + d) for d in allowed):
+        return
+    raise ActionExecutionError(
+        f"goto: domain {host!r} is not in the allowed domains for this deployment "
+        f"({', '.join(allowed)}). Stay within the target application."
+    )
+
+
+def _resolve_upload_paths(paths: list[str]) -> list[str]:
+    """Uploads may only come from the dedicated uploads directory. This blocks
+    a prompt-injected page from making the agent exfiltrate arbitrary host
+    files into the target app. Relative paths resolve against the uploads dir,
+    so the agent can reference files by bare name."""
+    root = settings.uploads_dir.resolve()
+    resolved: list[str] = []
+    for p in paths:
+        cand = Path(p)
+        if not cand.is_absolute():
+            cand = root / cand
+        cand = cand.resolve()
+        if not cand.is_relative_to(root):
+            raise ActionExecutionError(
+                f"upload_file: {p!r} is outside the uploads directory ({root}). "
+                "Only files placed under that directory can be uploaded."
+            )
+        if not cand.is_file():
+            raise ActionExecutionError(
+                f"upload_file: {p!r} does not exist under the uploads directory ({root})."
+            )
+        resolved.append(str(cand))
+    return resolved
+
+
 # Dispatch input/change events on contenteditable so frameworks (React, Lexical,
 # ProseMirror, Draft.js, Quill) detect the change and enable Send buttons.
 _CE_NOTIFY_JS = r"""
@@ -370,6 +423,7 @@ _CE_NOTIFY_JS = r"""
 
 def _execute_sync(page: Page, action: Action) -> str:
     if isinstance(action, GotoAction):
+        _check_domain_allowed(action.url)
         page.goto(action.url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS * 2)
         return f"Navigated to {action.url}"
     if isinstance(action, ClickTextAction):
@@ -378,6 +432,22 @@ def _execute_sync(page: Page, action: Action) -> str:
     if isinstance(action, ClickRoleAction):
         used = _try_click(page, _click_strategies(page, action.name, role=action.role))
         return f"Clicked {action.role}={action.name!r} via {used}"
+    if isinstance(action, ClickElementAction):
+        loc = page.locator(f'[data-uat-id="{action.element_id}"]').first
+        try:
+            loc.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+        except Exception:
+            raise ActionExecutionError(
+                f"click_element: element id {action.element_id} is not on the page. "
+                "Ids are only valid for the LATEST observation — the page has "
+                "changed since. Re-observe (extract_context) and use a fresh id."
+            )
+        try:
+            loc.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        loc.click(timeout=DEFAULT_TIMEOUT_MS)
+        return f"Clicked element #{action.element_id}"
     if isinstance(action, FillLabelAction):
         page.get_by_label(action.label, exact=False).first.fill(action.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Filled label {action.label!r}"
@@ -454,9 +524,10 @@ def _execute_sync(page: Page, action: Action) -> str:
         return f"Typed into contenteditable {target!r} via {used}"
 
     if isinstance(action, UploadFileAction):
+        paths = _resolve_upload_paths(action.paths)
         loc = _resolve_file_input(page, action.target)
-        loc.set_input_files(action.paths)
-        return f"Uploaded {len(action.paths)} file(s) into {action.target!r}"
+        loc.set_input_files(paths)
+        return f"Uploaded {len(paths)} file(s) into {action.target!r}"
 
     if isinstance(action, ScrollAction):
         # Walk UP from a known element to find the nearest scrollable ancestor
@@ -528,6 +599,32 @@ def _execute_sync(page: Page, action: Action) -> str:
     if isinstance(action, AssertTextAction):
         page.get_by_text(action.text, exact=False).first.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
         return f"Asserted text {action.text!r} visible"
+    if isinstance(action, AssertFieldValueAction):
+        loc = page.get_by_label(action.label, exact=False).first
+        try:
+            actual = loc.input_value(timeout=DEFAULT_TIMEOUT_MS)
+        except Exception as e:
+            raise ActionExecutionError(
+                f"assert_field_value: could not read field {action.label!r}: {e}"
+            ) from e
+        if actual != action.value:
+            raise ActionExecutionError(
+                f"assert_field_value: field {action.label!r} holds {actual!r}, "
+                f"expected {action.value!r}"
+            )
+        return f"Field {action.label!r} holds expected value {action.value!r}"
+    if isinstance(action, AssertUrlContainsAction):
+        needle = action.text.lower()
+        deadline = time.monotonic() + action.timeout_ms / 1000
+        while True:
+            url = page.url or ""
+            if needle in url.lower():
+                return f"URL contains {action.text!r} ({url})"
+            if time.monotonic() >= deadline:
+                raise ActionExecutionError(
+                    f"assert_url_contains: URL is {url!r}; it does not contain {action.text!r}"
+                )
+            time.sleep(0.2)
     raise ActionExecutionError(f"Unsupported action: {type(action).__name__}")
 
 

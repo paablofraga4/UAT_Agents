@@ -13,8 +13,9 @@ Salesforce, Slack…) than a one-shot multi-step plan.
 """
 from __future__ import annotations
 
+import base64
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -26,7 +27,10 @@ from app.browser.runner import ActionExecutionError, execute_action, observe
 from app.browser.session_broker import broker
 from app.models.schemas import (
     Action,
+    AssertFieldValueAction,
     AssertTextAction,
+    AssertUrlContainsAction,
+    ClickElementAction,
     ClickRoleAction,
     ClickTextAction,
     ExtractContextAction,
@@ -54,6 +58,7 @@ ACTION_REGISTRY = {
     "goto": GotoAction,
     "click_text": ClickTextAction,
     "click_role": ClickRoleAction,
+    "click_element": ClickElementAction,
     "fill_label": FillLabelAction,
     "fill_placeholder": FillPlaceholderAction,
     "type_text": TypeTextAction,
@@ -63,6 +68,8 @@ ACTION_REGISTRY = {
     "wait_for_text": WaitForTextAction,
     "screenshot": ScreenshotAction,
     "assert_text": AssertTextAction,
+    "assert_field_value": AssertFieldValueAction,
+    "assert_url_contains": AssertUrlContainsAction,
     "extract_context": ExtractContextAction,
     "upload_file": UploadFileAction,
     "scroll": ScrollAction,
@@ -70,9 +77,55 @@ ACTION_REGISTRY = {
 
 
 MAX_STEPS = 25
+MAX_STEPS_TEST_FORM = 40  # a test matrix legitimately needs more actions
 MAX_CONSECUTIVE_FAILURES = 3
 MAX_ACTION_REPEAT = 4  # same action chosen this many times in a row → stuck
 PAGE_TEXT_LIMIT_FOR_LLM = 5000
+MAX_SCREENSHOT_BYTES = 4_000_000  # don't ship absurdly large frames to the LLM
+
+
+# Structured Outputs schema for the Pilot decision. Strict mode requires every
+# property to be present, so optional action params are nullable and stripped
+# before Pydantic validation. This makes "Pilot returned an invalid action"
+# structurally impossible (wrong SEMANTICS are still caught by the registry).
+_NULLABLE_STR = {"type": ["string", "null"]}
+_NULLABLE_INT = {"type": ["integer", "null"]}
+_ACTION_PARAM_PROPS = {
+    "action": {"type": "string", "enum": list(ACTION_REGISTRY.keys())},
+    "url": _NULLABLE_STR,
+    "text": _NULLABLE_STR,
+    "role": _NULLABLE_STR,
+    "name": _NULLABLE_STR,
+    "label": _NULLABLE_STR,
+    "placeholder": _NULLABLE_STR,
+    "target": _NULLABLE_STR,
+    "value": _NULLABLE_STR,
+    "key": _NULLABLE_STR,
+    "element_id": _NULLABLE_INT,
+    "ms": _NULLABLE_INT,
+    "timeout_ms": _NULLABLE_INT,
+    "direction": {"type": ["string", "null"], "enum": ["down", "up", "bottom", "top", None]},
+    "amount": _NULLABLE_INT,
+    "paths": {"type": ["array", "null"], "items": {"type": "string"}},
+    "description": _NULLABLE_STR,
+}
+PILOT_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["act", "done", "give_up"]},
+        "thought": {"type": "string"},
+        "summary": _NULLABLE_STR,
+        "reason": _NULLABLE_STR,
+        "action": {
+            "type": ["object", "null"],
+            "properties": _ACTION_PARAM_PROPS,
+            "required": list(_ACTION_PARAM_PROPS.keys()),
+            "additionalProperties": False,
+        },
+    },
+    "required": ["decision", "thought", "summary", "reason", "action"],
+    "additionalProperties": False,
+}
 
 
 def _action_sig(action_dict: dict) -> str:
@@ -81,7 +134,7 @@ def _action_sig(action_dict: dict) -> str:
     typed messages, which can legitimately vary)."""
     d = action_dict or {}
     keys = ("action", "url", "text", "role", "name", "label", "placeholder",
-            "target", "key", "direction")
+            "target", "key", "direction", "element_id")
     return "|".join(f"{k}={d.get(k)}" for k in keys if d.get(k) is not None)
 
 
@@ -100,6 +153,7 @@ class AgentState(TypedDict, total=False):
     task_id: str
     session_id: str
     instruction: str
+    mode: str  # "task" | "test_form"
     page_context: dict
     interpreted_task: str
     step_results: list[dict]
@@ -125,7 +179,7 @@ async def _save_task(state: AgentState, status: TaskStatus) -> None:
         "session_id": state["session_id"],
         "instruction": state["instruction"],
         "status": status.value,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "plan_json": json.dumps({
             "interpreted_task": state.get("interpreted_task", ""),
             "steps": [s.get("action") for s in state.get("step_results", [])],
@@ -138,11 +192,38 @@ async def _save_task(state: AgentState, status: TaskStatus) -> None:
 
 
 def _parse_action(raw: dict) -> Action:
+    # The strict schema forces every param key to be present (as null when
+    # unused); drop the nulls so Pydantic defaults apply.
+    raw = {k: v for k, v in (raw or {}).items() if v is not None}
     kind = raw.get("action")
     cls = ACTION_REGISTRY.get(kind)
     if cls is None:
         raise ValueError(f"Disallowed action: {kind!r}")
     return cls(**raw)
+
+
+def _screenshot_b64(ctx: dict) -> str | None:
+    """Base64 of the latest observation screenshot for the multimodal Pilot."""
+    p = (ctx or {}).get("screenshot_path")
+    if not p:
+        return None
+    try:
+        data = Path(p).read_bytes()
+    except OSError:
+        return None
+    if not data or len(data) > MAX_SCREENSHOT_BYTES:
+        return None
+    return base64.b64encode(data).decode()
+
+
+def _pilot_system(state: AgentState) -> str:
+    if state.get("mode") == "test_form":
+        return prompts.PILOT_SYSTEM + prompts.PILOT_TEST_FORM_ADDENDUM
+    return prompts.PILOT_SYSTEM
+
+
+def _max_steps(state: AgentState) -> int:
+    return MAX_STEPS_TEST_FORM if state.get("mode") == "test_form" else MAX_STEPS
 
 
 def _trimmed_context(ctx: dict) -> dict:
@@ -188,9 +269,10 @@ async def node_pilot(state: AgentState) -> AgentState:
     state.setdefault("consecutive_failures", 0)
 
     # Stop conditions
-    if len(state["step_results"]) >= MAX_STEPS:
+    max_steps = _max_steps(state)
+    if len(state["step_results"]) >= max_steps:
         state["give_up"] = True
-        state["error"] = f"Reached max steps ({MAX_STEPS})"
+        state["error"] = f"Reached max steps ({max_steps})"
         return state
     if state["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES:
         state["give_up"] = True
@@ -205,7 +287,13 @@ async def node_pilot(state: AgentState) -> AgentState:
         "page_context": _trimmed_context(state["page_context"]),
     }, ensure_ascii=False)
 
-    raw = await llm.chat_json(prompts.PILOT_SYSTEM, user_msg)
+    raw = await llm.chat_json(
+        _pilot_system(state),
+        user_msg,
+        image_b64=_screenshot_b64(state.get("page_context") or {}),
+        schema=PILOT_DECISION_SCHEMA,
+        schema_name="pilot_decision",
+    )
     decision = (raw.get("decision") or "").lower()
     thought = raw.get("thought") or ""
 
@@ -279,7 +367,7 @@ async def node_pilot(state: AgentState) -> AgentState:
         index=idx,
         action=action.model_dump(),
         status=StepStatus.RUNNING,
-        started_at=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc),
     )
     try:
         outcome = await execute_action(session, state["task_id"], action)
@@ -293,7 +381,7 @@ async def node_pilot(state: AgentState) -> AgentState:
         result.status = StepStatus.FAILED
         result.error = str(e)
         state["consecutive_failures"] += 1
-    result.finished_at = datetime.utcnow()
+    result.finished_at = datetime.now(timezone.utc)
 
     serialized = result.model_dump(mode="json")
     state["step_results"].append(serialized)
@@ -358,6 +446,7 @@ async def node_report(state: AgentState) -> AgentState:
 
     user_msg = json.dumps({
         "instruction": state["instruction"],
+        "mode": state.get("mode", "task"),
         "interpreted_task": state.get("interpreted_task"),
         "success": state.get("success"),
         "summary": state.get("summary"),
@@ -416,17 +505,20 @@ def build_graph():
 graph = build_graph()
 
 
-async def run_task(task_id: str, session_id: str, instruction: str) -> AgentState:
+async def run_task(
+    task_id: str, session_id: str, instruction: str, mode: str = "task"
+) -> AgentState:
     state: AgentState = {
         "task_id": task_id,
         "session_id": session_id,
         "instruction": instruction,
+        "mode": mode,
         "step_results": [],
         "consecutive_failures": 0,
     }
     try:
         return await graph.ainvoke(
-            state, config={"recursion_limit": MAX_STEPS * 3 + 10}
+            state, config={"recursion_limit": _max_steps(state) * 3 + 10}
         )
     except Exception as e:
         # Any unhandled failure (Playwright wedged, LLM down, graph error) MUST
@@ -443,7 +535,7 @@ async def run_task(task_id: str, session_id: str, instruction: str) -> AgentStat
                 "session_id": session_id,
                 "instruction": instruction,
                 "status": TaskStatus.FAILED.value,
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "plan_json": None,
                 "steps_json": json.dumps(state.get("step_results", []), default=str),
                 "report_path": state.get("report_path"),

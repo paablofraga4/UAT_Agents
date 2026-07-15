@@ -7,7 +7,6 @@ playwright>=1.49
 greenlet>=3.2
 openai>=1.57
 langgraph>=0.2.59,<0.3
-langfuse>=2.60,<3
 aiosqlite>=0.20
 websockets>=13
 python-multipart>=0.0.19

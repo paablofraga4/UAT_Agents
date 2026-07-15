@@ -14,7 +14,7 @@ def task_dir(session_id: str, task_id: str) -> Path:
 
 
 def screenshot_path(session_id: str, task_id: str, label: str) -> Path:
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     return task_dir(session_id, task_id) / "screenshots" / f"{ts}_{label}.png"
 
 

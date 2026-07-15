@@ -53,6 +53,17 @@ class ClickRoleAction(BaseModel):
     description: str = ""
 
 
+class ClickElementAction(BaseModel):
+    """Click an element by the numeric id shown in the observation
+    (`[12][button] Save` → element_id 12). The observer stamps each reported
+    element with a matching data attribute, so this is the most precise click:
+    no text/locator guessing. Ids are only valid for the CURRENT observation —
+    after a navigation or re-render, re-observe to get fresh ids."""
+    action: Literal["click_element"] = "click_element"
+    element_id: int = Field(ge=0)
+    description: str = ""
+
+
 class FillLabelAction(BaseModel):
     action: Literal["fill_label"] = "fill_label"
     label: str
@@ -115,6 +126,25 @@ class AssertTextAction(BaseModel):
     description: str = ""
 
 
+class AssertFieldValueAction(BaseModel):
+    """Assert that the form field identified by `label` currently holds
+    exactly `value`. Unlike assert_text, this checks the field's STATE (its
+    input value), which is what form testing needs."""
+    action: Literal["assert_field_value"] = "assert_field_value"
+    label: str
+    value: str
+    description: str = ""
+
+
+class AssertUrlContainsAction(BaseModel):
+    """Assert that the current URL contains `text` (case-insensitive).
+    Proves redirects / route changes that leave no unique visible text."""
+    action: Literal["assert_url_contains"] = "assert_url_contains"
+    text: str
+    timeout_ms: int = Field(default=5000, ge=0, le=30000)
+    description: str = ""
+
+
 class ExtractContextAction(BaseModel):
     action: Literal["extract_context"] = "extract_context"
     description: str = ""
@@ -147,6 +177,7 @@ Action = Union[
     GotoAction,
     ClickTextAction,
     ClickRoleAction,
+    ClickElementAction,
     FillLabelAction,
     FillPlaceholderAction,
     TypeTextAction,
@@ -156,6 +187,8 @@ Action = Union[
     WaitForTextAction,
     ScreenshotAction,
     AssertTextAction,
+    AssertFieldValueAction,
+    AssertUrlContainsAction,
     ExtractContextAction,
     ScrollAction,
     UploadFileAction,
@@ -202,6 +235,11 @@ class TaskStatus(str, Enum):
 class CreateTaskRequest(BaseModel):
     session_id: str
     instruction: str
+    # "task": free-form instruction. "test_form": the agent designs and runs a
+    # test matrix (required fields, invalid formats, boundaries, happy path)
+    # against the form the instruction points at, and the report is a
+    # case-by-case pass/fail table.
+    mode: Literal["task", "test_form"] = "task"
 
 
 class TaskInfo(BaseModel):
