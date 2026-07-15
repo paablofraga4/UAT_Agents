@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Modal fixture</title></head>
+<body>
+<main>
+  <h1>Dashboard</h1>
+  <button id="open">Open settings</button>
+</main>
+<div id="overlay" role="dialog" aria-modal="true" aria-label="Cookie consent"
+     style="position:fixed;inset:20% 25%;background:#fff;border:2px solid #333;padding:20px;">
+  <h2>Cookie consent</h2>
+  <p>We use cookies.</p>
+  <button id="accept">Accept</button>
+  <button id="close" aria-label="Close">✕</button>
+</div>
+<script>
+  const overlay = document.getElementById('overlay');
+  const hide = () => overlay.remove();
+  document.getElementById('accept').addEventListener('click', hide);
+  document.getElementById('close').addEventListener('click', hide);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide(); });
+</script>
+</body>
+</html>

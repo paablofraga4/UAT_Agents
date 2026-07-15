@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Form fixture</title></head>
+<body>
+<header style="position:sticky;top:0;background:#eee;">
+  <nav>
+    <a href="form.html">Registration</a>
+    <a href="chat.html">Chat</a>
+    <a href="upload.html">Documents</a>
+  </nav>
+</header>
+<main>
+  <h1>Patient registration</h1>
+  <form id="f">
+    <div><label for="fn">First name</label><input id="fn" name="fn"></div>
+    <div><label for="email">Email</label><input id="email" name="email"></div>
+    <div>
+      <label for="country">Country</label>
+      <select id="country"><option>Spain</option><option>France</option><option>Portugal</option></select>
+    </div>
+    <div><label for="bio">Bio</label><textarea id="bio" placeholder="Tell us about the patient"></textarea></div>
+    <button type="submit">Save</button>
+    <button type="button" id="cont">Save and continue</button>
+  </form>
+  <div id="msg" role="status"></div>
+</main>
+<script>
+  const msg = document.getElementById('msg');
+  const valid = () => {
+    const fn = document.getElementById('fn').value.trim();
+    const email = document.getElementById('email').value.trim();
+    if (!fn) { msg.textContent = 'First name is required'; return false; }
+    if (email && !email.includes('@')) { msg.textContent = 'Invalid email address'; return false; }
+    return true;
+  };
+  document.getElementById('f').addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (valid()) msg.textContent = 'Saved successfully';
+  });
+  document.getElementById('cont').addEventListener('click', () => {
+    if (valid()) window.location.href = 'form_ok.html';
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><title>Chat fixture</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  #layout { display: flex; height: 100vh; }
+  #sidebar { width: 260px; border-right: 1px solid #ccc; display: flex; flex-direction: column; }
+  #people { overflow-y: auto; flex: 1; }
+  .person { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee; }
+  #panel { flex: 1; display: flex; flex-direction: column; }
+  #thread { flex: 1; overflow-y: auto; padding: 12px; }
+  #composer-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #ccc; }
+  #composer { flex: 1; border: 1px solid #aaa; min-height: 40px; padding: 6px; }
+  .msg { margin: 4px 0; padding: 6px; background: #eef; border-radius: 6px; }
+</style>
+</head>
+<body>
+<header style="position:fixed;top:0;left:0;right:0;height:0;">
+  <nav style="position:fixed;top:0;right:0;"><a href="form.html">Registration</a></nav>
+</header>
+<div id="layout">
+  <div id="sidebar">
+    <input id="search" placeholder="Buscar mensajes" aria-label="Buscar mensajes">
+    <div id="people"></div>
+  </div>
+  <div id="panel">
+    <h2 id="with">Selecciona una conversación</h2>
+    <div id="thread"></div>
+    <div id="composer-row" style="display:none;">
+      <div id="composer" contenteditable="true" aria-label="Escribe un mensaje"></div>
+      <button id="send" aria-label="Enviar" disabled>➤</button>
+    </div>
+  </div>
+</div>
+<script>
+  // Incrementally-loaded list, like real chat apps: only a window of people is
+  // in the DOM; scrolling to the bottom loads the next chunk. The interesting
+  // person is in the LAST chunk, so the agent (and the tests) must SEARCH or
+  // SCROLL repeatedly to find her.
+  const names = [];
+  for (let i = 1; i <= 89; i++) names.push('Persona ' + i);
+  names.push('Nadia Fernandez');
+  const CHUNK = 30;
+  const people = document.getElementById('people');
+  const composerRow = document.getElementById('composer-row');
+  const composer = document.getElementById('composer');
+  const send = document.getElementById('send');
+  const thread = document.getElementById('thread');
+
+  const personEl = (n) => {
+    const d = document.createElement('div');
+    d.className = 'person';
+    d.textContent = n;
+    d.addEventListener('click', () => {
+      document.getElementById('with').textContent = 'Chat con ' + n;
+      composerRow.style.display = 'flex';
+      thread.innerHTML = '';
+    });
+    return d;
+  };
+
+  let filter = '';
+  let rendered = 0;
+  const matches = () =>
+    names.filter(n => !filter || n.toLowerCase().includes(filter.toLowerCase()));
+  const renderMore = () => {
+    matches().slice(rendered, rendered + CHUNK).forEach(n => people.appendChild(personEl(n)));
+    rendered = Math.min(rendered + CHUNK, matches().length);
+  };
+  const reset = () => { people.innerHTML = ''; rendered = 0; renderMore(); };
+  reset();
+
+  people.addEventListener('scroll', () => {
+    if (people.scrollTop + people.clientHeight >= people.scrollHeight - 40) renderMore();
+  });
+  document.getElementById('search').addEventListener('input', (e) => {
+    filter = e.target.value;
+    reset();
+  });
+
+  // Send only enables after a real input event on the contenteditable —
+  // exactly the framework behaviour (React/Lexical) that used to break typing.
+  composer.addEventListener('input', () => {
+    send.disabled = composer.textContent.trim().length === 0;
+  });
+  const doSend = () => {
+    const text = composer.textContent.trim();
+    if (!text) return;
+    const m = document.createElement('div');
+    m.className = 'msg';
+    m.textContent = text;
+    thread.appendChild(m);
+    composer.textContent = '';
+    send.disabled = true;
+  };
+  send.addEventListener('click', doSend);
+  composer.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+  });
+</script>
+</body>
+</html>

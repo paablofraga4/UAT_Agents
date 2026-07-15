@@ -4,6 +4,7 @@ import contextlib
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.agents.events import bus
+from app.api.deps import ws_token_ok
 
 
 router = APIRouter()
@@ -11,6 +12,9 @@ router = APIRouter()
 
 @router.websocket("/ws/tasks/{task_id}")
 async def task_events(ws: WebSocket, task_id: str) -> None:
+    if not ws_token_ok(ws):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     queue = bus.subscribe(task_id)
     try:
