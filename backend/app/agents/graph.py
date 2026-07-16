@@ -1,4 +1,5 @@
-"""LangGraph multi-agent workflow.
+"""Multi-agent ReAct workflow, driven by a plain async loop (no graph
+framework — see the driver section at the bottom for why).
 
 ReAct loop:
 
@@ -18,8 +19,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
-
-from langgraph.graph import END, StateGraph
 
 from app.agents import llm, prompts
 from app.agents.events import bus
@@ -487,25 +486,36 @@ async def node_report(state: AgentState) -> AgentState:
     return state
 
 
-# ---------- graph ----------
+# ---------- driver ----------
+#
+# The agent is a plain ReAct loop: observer → pilot → (loop back to observer, or
+# stop) → reporter. We drive it with a small async loop rather than a graph
+# framework — the flow is trivial and a hand-rolled loop removes a heavy
+# dependency chain (langgraph/langchain) that was both an install-fragility
+# source (native wheels, Python-version pins) and a runtime-break source
+# (version-skew errors like `module 'langchain' has no attribute 'debug'`).
 
-def build_graph():
-    g = StateGraph(AgentState)
-    g.add_node("observer", node_observe)
-    g.add_node("pilot", node_pilot)
-    g.add_node("reporter", node_report)
-
-    g.set_entry_point("observer")
-    g.add_edge("observer", "pilot")
-    g.add_conditional_edges("pilot", route_after_pilot, {
-        "observer": "observer",
-        "reporter": "reporter",
-    })
-    g.add_edge("reporter", END)
-    return g.compile()
-
-
-graph = build_graph()
+async def _drive(state: AgentState) -> AgentState:
+    # Hard ceiling on node visits so a logic bug can never spin forever. The
+    # real budget is enforced inside node_pilot (MAX_STEPS); this is 2 nodes
+    # (observe+pilot) per step plus generous slack.
+    max_visits = _max_steps(state) * 3 + 10
+    visits = 0
+    while True:
+        await node_observe(state)
+        visits += 1
+        await node_pilot(state)
+        visits += 1
+        if route_after_pilot(state) == "reporter":
+            break
+        if visits >= max_visits:
+            # Safety net only — should be unreachable given node_pilot's caps.
+            state["give_up"] = True
+            state["success"] = False
+            state["error"] = f"Reached max steps ({_max_steps(state)})"
+            break
+    await node_report(state)
+    return state
 
 
 async def run_task(
@@ -520,9 +530,7 @@ async def run_task(
         "consecutive_failures": 0,
     }
     try:
-        return await graph.ainvoke(
-            state, config={"recursion_limit": _max_steps(state) * 3 + 10}
-        )
+        return await _drive(state)
     except Exception as e:
         # Any unhandled failure (Playwright wedged, LLM down, graph error) MUST
         # still close the loop for the UI — otherwise the WebSocket waits on a
