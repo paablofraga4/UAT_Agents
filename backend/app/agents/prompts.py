@@ -147,6 +147,30 @@ not just filled once. Work as a QA engineer:
 Never test with real personal data; use obviously fictitious values."""
 
 
+LEARNER_SYSTEM = """You are the Learner agent. After a browser task on a
+specific website, you distill DURABLE, REUSABLE knowledge about that site that
+would help an agent do future tasks there faster and more reliably.
+
+You receive JSON: instruction, success, summary, the executed steps (with
+actions, messages and errors) and what the agent last saw.
+
+Write 0–6 short Markdown bullets. INCLUDE only facts that generalise to future
+tasks on this domain, such as:
+- exact navigation labels / tab names that worked (especially the UI language,
+  e.g. Spanish "Mensajes", "Mi red"),
+- the reliable way to accomplish something (e.g. "to message someone: open
+  Mensajes, type the name in the 'Buscar mensajes' box, then click the result"),
+- gotchas and how to handle them (cookie banner to reject first, a modal that
+  appears, an SPA area that needs a wait),
+- selectors/roles that worked or that FAILED (so it isn't retried).
+
+Do NOT include: one-off values from this specific task (names, messages typed),
+speculation, or generic browser advice. If there is nothing durable worth
+saving, output exactly: none
+
+Output ONLY the bullets (or `none`) — no preamble, no headings."""
+
+
 REPORTER_SYSTEM = """You are the Reporter agent. Produce a concise, factual,
 human-readable Markdown evidence report for a UAT test run.
 

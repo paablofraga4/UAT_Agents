@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # exfiltrate arbitrary host files into the target web app.
     uploads_dir: Path = Path("./uploads")
 
+    # Domain knowledge base. Curated per-domain playbooks (hand-authored,
+    # committed) live in knowledge_dir as "<domain>.md"; findings the agent
+    # accumulates at runtime are appended to knowledge_learned_dir (gitignored).
+    # Both are loaded and injected into the Pilot for that domain.
+    knowledge_dir: Path = Path("./knowledge")
+    knowledge_learned_dir: Path = Path("./knowledge_learned")
+    # Whether the agent writes back what it learns after each task.
+    knowledge_learning_enabled: bool = True
+
     headless: bool = False
     browser_viewport_width: int = 1366
     browser_viewport_height: int = 820
@@ -48,6 +57,8 @@ class Settings(BaseSettings):
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.knowledge_dir.mkdir(parents=True, exist_ok=True)
+        self.knowledge_learned_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
 

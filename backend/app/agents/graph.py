@@ -20,8 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
+from app import knowledge
 from app.agents import llm, prompts
 from app.agents.events import bus
+from app.config import settings
 from app.browser.runner import ActionExecutionError, execute_action, observe
 from app.browser.session_broker import broker
 from app.models.schemas import (
@@ -216,9 +218,21 @@ def _screenshot_b64(ctx: dict) -> str | None:
 
 
 def _pilot_system(state: AgentState) -> str:
+    system = prompts.PILOT_SYSTEM
     if state.get("mode") == "test_form":
-        return prompts.PILOT_SYSTEM + prompts.PILOT_TEST_FORM_ADDENDUM
-    return prompts.PILOT_SYSTEM
+        system += prompts.PILOT_TEST_FORM_ADDENDUM
+    # Inject the domain playbook for wherever the agent currently IS, so it
+    # adapts if the task navigates across domains mid-run.
+    playbook = knowledge.load_playbook_for_url((state.get("page_context") or {}).get("url"))
+    if playbook:
+        system += (
+            "\n\n--- DOMAIN PLAYBOOK ---\n"
+            "Prior knowledge about THIS site (its sections, how to do things, "
+            "and gotchas). Trust it over guessing, but if the live page "
+            "contradicts it, believe the page (the site may have changed).\n\n"
+            + playbook
+        )
+    return system
 
 
 def _max_steps(state: AgentState) -> int:
@@ -486,6 +500,34 @@ async def node_report(state: AgentState) -> AgentState:
     return state
 
 
+async def node_learn(state: AgentState) -> AgentState:
+    """Distill durable, reusable knowledge about the domain and append it to its
+    learned playbook. Best-effort — never affects the task outcome."""
+    if not settings.knowledge_learning_enabled:
+        return state
+    ctx = state.get("page_context") or {}
+    domain = knowledge.domain_for_url(ctx.get("url"))
+    if not domain:
+        return state
+    try:
+        user_msg = json.dumps({
+            "instruction": state["instruction"],
+            "success": state.get("success"),
+            "summary": state.get("summary"),
+            "steps": _history_for_llm(state.get("step_results", [])),
+            "last_seen": (ctx.get("visible_text") or "")[:1500],
+        }, ensure_ascii=False, default=str)
+        findings = await llm.chat_text(prompts.LEARNER_SYSTEM, user_msg)
+        knowledge.record_findings(domain, state["instruction"], findings)
+        if findings and findings.strip().lower() != "none":
+            await _emit(state["task_id"], "log",
+                        message=f"Learner: updated knowledge for {domain}.")
+    except Exception as e:  # noqa: BLE001 - learning must never break a run
+        await _emit(state["task_id"], "log",
+                    message=f"Learner skipped: {type(e).__name__}", level="error")
+    return state
+
+
 # ---------- driver ----------
 #
 # The agent is a plain ReAct loop: observer → pilot → (loop back to observer, or
@@ -515,6 +557,7 @@ async def _drive(state: AgentState) -> AgentState:
             state["error"] = f"Reached max steps ({_max_steps(state)})"
             break
     await node_report(state)
+    await node_learn(state)
     return state
 
 

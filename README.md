@@ -56,6 +56,25 @@ Page content is explicitly treated as untrusted data (prompt-injection rule in
 the system prompt), uploads are confined to a dedicated directory, and agent
 navigation can be fenced with a domain allowlist.
 
+### Domain knowledge base (playbooks)
+
+Each web domain gets a Markdown **playbook** giving the agent prior context —
+its sections/tabs, how to do common things, and gotchas (reject the cookie
+banner first, the UI is in Spanish, messaging needs the search box…). The Pilot
+reads the playbook for wherever it currently is, so it starts with a mental
+model instead of rediscovering the app every run.
+
+Two layers, keyed by domain (`www.linkedin.com` → `linkedin.com`):
+
+- **Curated** — `backend/knowledge/<domain>.md`, hand-authored and committed.
+  Drop your own files here (a seed `linkedin.com.md` ships in the repo).
+- **Learned** — `backend/knowledge_learned/<domain>.md`, appended automatically
+  after each task by a Learner step that distills durable, reusable findings
+  (runtime, gitignored, bounded). Toggle with `KNOWLEDGE_LEARNING_ENABLED`.
+
+Both are concatenated (curated first) and injected into the Pilot. Inspect what
+the agent knows about a domain via `GET /knowledge/{domain}`.
+
 ---
 
 ## Stack
@@ -207,8 +226,9 @@ controlled browser automation, visible execution and auditable evidence.
 - [x] Deterministic test suite + CI
 - [ ] CDP screencast transport (higher fps than JPEG polling)
 - [ ] Browser containers (one isolated container per session)
-- [ ] Application Profiles (learned knowledge of target apps)
+- [x] Domain knowledge base — curated + learned per-domain playbooks
 - [ ] Recipes (deterministic replays of successful flows)
+- [ ] Playbook editing from the UI (read API already exists)
 - [ ] Human takeover mid-task (pause agent, act, resume)
 - [ ] Multi-user auth (per-user session ownership, SSO)
 - [ ] MCP server exposing browser actions / profiles / recipes
