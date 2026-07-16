@@ -4,7 +4,7 @@ import time
 import pytest
 
 from app.agents.graph import PILOT_DECISION_SCHEMA, _action_sig, _page_fp, _parse_action
-from app.browser.session_broker import SessionWedgedError, _SessionWorker
+from app.browser.session_broker import SessionBusyError, SessionWedgedError, _SessionWorker
 from app.models.schemas import ClickElementAction, ClickTextAction
 
 
@@ -62,26 +62,37 @@ def test_page_fp_changes_when_interactives_change():
     assert _page_fp(base) != _page_fp(after)
 
 
-async def test_wedged_worker_is_quarantined():
-    w = _SessionWorker("test-wedge")
-    # Don't launch a browser — enqueue work directly on the (unstarted) queue
-    # via a thread that behaves like the worker loop.
+def _start_fake_loop(w: _SessionWorker) -> None:
+    """Run the worker's queue protocol without launching a browser."""
     import threading
 
     def loop():
         while True:
-            fn, fut = w._queue.get()
+            fn, fut, started = w._queue.get()
             if fn is None:
                 return
+            if fut.cancelled():
+                continue
+            started.set()
             try:
-                fut.set_result(fn())
+                value = fn()
             except BaseException as e:  # noqa: BLE001
-                fut.set_exception(e)
+                if not fut.cancelled():
+                    fut.set_exception(e)
+                continue
+            if not fut.cancelled():
+                fut.set_result(value)
 
     threading.Thread(target=loop, daemon=True).start()
 
+
+async def test_wedged_worker_is_quarantined():
+    w = _SessionWorker("test-wedge")
+    _start_fake_loop(w)
+
     assert await w.run(lambda: 42, timeout=5.0) == 42
 
+    # The EXECUTING callable exceeds its own timeout → genuine wedge.
     with pytest.raises(SessionWedgedError):
         await w.run(lambda: time.sleep(3), timeout=0.2)
     assert w.wedged
@@ -89,4 +100,28 @@ async def test_wedged_worker_is_quarantined():
     # Once wedged, further calls are rejected immediately.
     with pytest.raises(SessionWedgedError):
         await w.run(lambda: 1, timeout=5.0)
+    w.shutdown()
+
+
+async def test_queued_call_timing_out_does_not_wedge_session():
+    """The live-view screenshot poller regression: a short-timeout call queued
+    BEHIND a long-but-legitimate action (e.g. a click fallback chain) must be
+    skipped as busy — not quarantine the session and kill the agent's task."""
+    import asyncio
+
+    w = _SessionWorker("test-busy")
+    _start_fake_loop(w)
+
+    # Occupy the worker with a "long action" (like the 26s click chain).
+    long_action = asyncio.create_task(w.run(lambda: time.sleep(1.5), timeout=10.0))
+    await asyncio.sleep(0.1)  # let it start executing
+
+    # A poller call with a short timeout queues behind it and expires waiting.
+    with pytest.raises(SessionBusyError):
+        await w.run(lambda: "frame", timeout=0.3)
+
+    # The session must remain healthy: not wedged, still serving calls.
+    assert not w.wedged
+    await long_action
+    assert await w.run(lambda: 7, timeout=5.0) == 7
     w.shutdown()

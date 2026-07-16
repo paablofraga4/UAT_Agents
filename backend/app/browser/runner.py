@@ -268,27 +268,52 @@ async def observe(session: BrowserSession, task_id: str) -> PageContext:
     )
 
 
-def _try_click(page: Page, locator_builders: list[tuple[str, Any]], per_try_ms: int = 1500) -> str:
+CLICK_CHAIN_BUDGET_S = 10.0    # hard wall-clock cap across ALL fallback strategies
+CLICK_MISS_PATIENCE_S = 3.0    # keep re-scanning this long while NOTHING matches
+                               # (gives async renders a chance without the old
+                               # 26s-per-miss worker starvation)
+
+
+def _try_click(page: Page, locator_builders: list[tuple[str, Any]], per_try_ms: int = 1200) -> str:
     """Try a sequence of (label, locator-factory) pairs. Returns the label of the
-    first one that succeeds. Each attempt: wait for visibility, then click. If the
-    element is disabled (e.g. Send button before composer registers input), wait
-    briefly for it to become enabled."""
+    first one that succeeds.
+
+    Each strategy is first PROBED with a cheap count() — a strategy that matches
+    nothing costs milliseconds, not a full visibility-wait. Only matching
+    locators get the wait+click treatment (with a re-poll for temporarily
+    disabled targets, e.g. a Send button waiting for composer input). While no
+    strategy matches anything, the whole chain is re-scanned for up to
+    CLICK_MISS_PATIENCE_S; CLICK_CHAIN_BUDGET_S is the hard cap. The previous
+    scheme (1.5s visibility-wait per strategy, no cap) blocked the session
+    worker ~26s per miss, starving live-view frames and the next observation."""
     tried: list[str] = []
-    for label, build in locator_builders:
-        tried.append(label)
-        try:
-            loc = build()
-            loc.wait_for(state="visible", timeout=per_try_ms)
+    hard_deadline = time.monotonic() + CLICK_CHAIN_BUDGET_S
+    miss_deadline = time.monotonic() + CLICK_MISS_PATIENCE_S
+    first_pass = True
+    while True:
+        for label, build in locator_builders:
+            if first_pass:
+                tried.append(label)
             try:
-                loc.click(timeout=per_try_ms)
+                loc = build()
+                if loc.count() == 0:
+                    continue
+                loc.wait_for(state="visible", timeout=per_try_ms)
+                try:
+                    loc.click(timeout=per_try_ms)
+                except Exception:
+                    # Element may be temporarily disabled (e.g. Send waiting for
+                    # input event from a contenteditable). Re-poll for enabled state.
+                    loc.click(timeout=DEFAULT_TIMEOUT_MS, force=False)
+                return label
             except Exception:
-                # Element may be temporarily disabled (e.g. Send waiting for input
-                # event from a contenteditable). Re-poll for enabled state.
-                loc.click(timeout=DEFAULT_TIMEOUT_MS, force=False)
-            return label
-        except Exception:
-            continue
-    # A clear, actionable message — "Timeout 1500ms exceeded" alone told us
+                continue
+        first_pass = False
+        now = time.monotonic()
+        if now >= miss_deadline or now >= hard_deadline:
+            break
+        time.sleep(0.25)
+    # A clear, actionable message — "Timeout exceeded" alone told us
     # nothing about WHAT was searched for.
     raise ActionExecutionError(
         "no clickable element matched. Tried: " + "; ".join(tried)

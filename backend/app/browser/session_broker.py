@@ -43,8 +43,17 @@ DEFAULT_CALL_TIMEOUT_S = 45.0
 
 
 class SessionWedgedError(RuntimeError):
-    """Raised when a session's worker thread did not return within the timeout.
-    The session is considered unusable from this point on."""
+    """Raised when the callable a session's worker is EXECUTING did not return
+    within the timeout. The session is considered unusable from this point on."""
+
+
+class SessionBusyError(RuntimeError):
+    """Raised when a call waited in the worker's queue past its timeout without
+    ever starting — the worker is busy with other (legitimate) work, not stuck.
+    The session stays healthy; the caller may retry or skip. Without this
+    distinction, a low-priority caller with a short timeout (e.g. the live-view
+    screenshot poller) queued behind one long action would falsely quarantine
+    the whole session and kill the agent's task mid-run."""
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +63,7 @@ class SessionWedgedError(RuntimeError):
 class _SessionWorker:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        self._queue: "Queue[tuple[Optional[Callable], Future]]" = Queue()
+        self._queue: "Queue[tuple[Optional[Callable], Future, threading.Event]]" = Queue()
         self._thread = threading.Thread(
             target=self._loop, name=f"pw-{session_id}", daemon=True
         )
@@ -91,11 +100,12 @@ class _SessionWorker:
             return
         self._started.set()
         while not self._stop:
-            fn, fut = self._queue.get()
+            fn, fut, started = self._queue.get()
             if fn is None:
                 break
             if fut.cancelled():
                 continue
+            started.set()
             try:
                 value = fn()
             except BaseException as e:  # noqa: BLE001 - propagate to the awaiting caller
@@ -118,16 +128,26 @@ class _SessionWorker:
         if self.wedged:
             raise SessionWedgedError(f"session {self.session_id} is wedged")
         fut: Future = Future()
-        self._queue.put((fn, fut))
+        started = threading.Event()
+        self._queue.put((fn, fut, started))
         try:
             # wrap_future bridges the worker-thread Future onto the event loop
             # WITHOUT parking an executor thread on .result().
             return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError) as e:
-            # The worker thread is still running the wedged callable. Anything
-            # queued behind it would never run, so quarantine the session.
-            self.wedged = True
             fut.cancel()
+            if not started.is_set():
+                # Our callable never began — the worker is busy with OTHER
+                # work (e.g. a long click-fallback chain) and we merely waited
+                # in the queue. The session is healthy: don't quarantine it.
+                raise SessionBusyError(
+                    f"session {self.session_id} busy: call skipped after "
+                    f"waiting {timeout}s in queue"
+                ) from e
+            # Our callable IS the one executing and it never returned:
+            # the worker is genuinely stuck. Anything queued behind it would
+            # never run, so quarantine the session.
+            self.wedged = True
             raise SessionWedgedError(
                 f"Playwright call timed out after {timeout}s; session "
                 f"{self.session_id} quarantined"
@@ -135,7 +155,7 @@ class _SessionWorker:
 
     def shutdown(self) -> None:
         self._stop = True
-        self._queue.put((None, Future()))
+        self._queue.put((None, Future(), threading.Event()))
 
 
 # ---------------------------------------------------------------------------

@@ -91,7 +91,10 @@ Operating rules:
   ASSUME IT'S BELOW THE FOLD, not absent.
 
 - FIND-A-PERSON / FIND-AN-ITEM WORKFLOW (chats, conversations, contacts, rows
-  in a list). Always follow this order before considering give_up:
+  in a list). NEVER click a person's/item's name that is NOT literally present
+  in the CURRENT observation (visible text or numbered elements) — a blind
+  click on an absent name always fails and wastes a step. Instead, always
+  follow this order before considering give_up:
     1. Look for a search box on the page (often labeled "Buscar", "Search",
        "Buscar mensajes"). If present, use `type_text` with that target and
        the person's name, then `wait` 800–1500ms and `extract_context`.
