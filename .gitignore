@@ -28,6 +28,11 @@ test-results/
 /backend/storage/
 *.log
 
+# Knowledge base: curated playbooks (knowledge/) ARE committed; the agent's
+# runtime-accumulated findings are not.
+/knowledge_learned/
+/backend/knowledge_learned/
+
 # Editors / OS
 .vscode/
 .idea/

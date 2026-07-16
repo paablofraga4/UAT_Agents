@@ -79,3 +79,20 @@ async def session_factory(fixture_server):
 def uploads_dir() -> Path:
     settings.uploads_dir.mkdir(parents=True, exist_ok=True)
     return settings.uploads_dir
+
+
+@pytest.fixture(autouse=True)
+def _isolate_knowledge_dirs(tmp_path, monkeypatch):
+    """Keep every test's knowledge writes in a temp dir so a run (e.g. the
+    graph tests that exercise node_learn) never pollutes the real committed
+    playbooks or the runtime learned dir. Tests that need specific knowledge
+    content override these paths themselves; this is just the safe default."""
+    from app import knowledge
+
+    monkeypatch.setattr(settings, "knowledge_dir", tmp_path / "kb")
+    monkeypatch.setattr(settings, "knowledge_learned_dir", tmp_path / "kb_learned")
+    settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
+    settings.knowledge_learned_dir.mkdir(parents=True, exist_ok=True)
+    knowledge._cache.clear()
+    yield
+    knowledge._cache.clear()

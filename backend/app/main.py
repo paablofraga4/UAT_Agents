@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from app.api import knowledge as knowledge_api
 from app.api import screen as screen_api
 from app.api import sessions as sessions_api
 from app.api import tasks as tasks_api
@@ -45,6 +46,7 @@ app.include_router(sessions_api.router)
 app.include_router(tasks_api.router)
 app.include_router(ws_api.router)
 app.include_router(screen_api.router)
+app.include_router(knowledge_api.router)
 
 
 # Evidence (screenshots, reports) can contain everything visible in the target
