@@ -30,7 +30,7 @@ produces an auditable evidence report.
                                                    └──────────────────────────┘
 ```
 
-### Agent loop (LangGraph — ReAct)
+### Agent loop (ReAct)
 
 ```
 observer → pilot ──act──► executor → observer (cycle)
@@ -65,7 +65,7 @@ navigation can be fenced with a domain allowlist.
 - **Backend**: FastAPI + WebSockets
 - **Browser**: Playwright (Chromium, headed or headless), one worker thread +
   browser per session
-- **Agents**: LangGraph + OpenAI (default: `gpt-4o`, vision + structured outputs)
+- **Agents**: plain async ReAct loop + OpenAI (default: `gpt-4o`, vision + structured outputs) — no heavy agent framework
 - **Storage**: SQLite (sessions/tasks) + filesystem (screenshots, reports)
 - **Tests**: pytest + a local fixture web app + headless Chromium (CI on
   GitHub Actions)
