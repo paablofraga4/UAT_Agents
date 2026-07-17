@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Puerta · Registros</title>
+<style>
+  :root {
+    --bg: #fafaf8;
+    --fg: #1a1a1a;
+    --muted: #8a8a86;
+    --line: #e6e6e2;
+    --ok: #2e7d4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131312;
+      --fg: #ececea;
+      --muted: #8a8a86;
+      --line: #2a2a28;
+      --ok: #5dbb85;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 48px 24px 64px;
+  }
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 4px;
+  }
+  .subtitulo {
+    color: var(--muted);
+    font-size: 14px;
+    margin: 0 0 40px;
+  }
+  /* Confirmación de registro */
+  .confirmacion {
+    text-align: center;
+    padding: 80px 0;
+  }
+  .confirmacion .icono { font-size: 48px; }
+  .confirmacion h2 { font-size: 22px; font-weight: 600; margin: 16px 0 4px; }
+  .confirmacion .hora { color: var(--muted); }
+  .confirmacion a {
+    display: inline-block;
+    margin-top: 32px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  /* Lista de registros */
+  .dia {
+    color: var(--muted);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 32px 0 8px;
+  }
+  .registro {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .registro .hora { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .registro .etiqueta { color: var(--ok); font-size: 13px; }
+  .vacio, .error, .cargando { color: var(--muted); padding: 40px 0; text-align: center; }
+  .error { color: #c0564f; }
+</style>
+</head>
+<body>
+<main id="app"><p class="cargando">Cargando…</p></main>
+<script>
+const SUPABASE_URL = "https://agpcrbspxbrgdnciyuxa.supabase.co";
+const SUPABASE_KEY = "sb_publishable_v7HcBFHqQR11778fSzEITA_MkWA1Hrr";
+const TABLA = "registros_puerta";
+
+const app = document.getElementById("app");
+const esRegistro = location.pathname.replace(/\/$/, "").endsWith("/registro")
+  || new URLSearchParams(location.search).has("r");
+
+const cabeceras = {
+  apikey: SUPABASE_KEY,
+  Authorization: "Bearer " + SUPABASE_KEY,
+  "Content-Type": "application/json",
+};
+
+if (esRegistro) registrar();
+else listar();
+
+async function registrar() {
+  // Evita duplicados si el móvil recarga la página tras el toque NFC
+  const ultimo = Number(sessionStorage.getItem("ultimoRegistro") || 0);
+  if (Date.now() - ultimo < 60000) return confirmar(new Date(ultimo));
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${TABLA}`, {
+      method: "POST",
+      headers: { ...cabeceras, Prefer: "return=representation" },
+      body: "{}",
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const [fila] = await res.json();
+    const fecha = new Date(fila.creado_en);
+    sessionStorage.setItem("ultimoRegistro", String(fecha.getTime()));
+    confirmar(fecha);
+  } catch (e) {
+    app.innerHTML = `<p class="error">No se pudo registrar. Comprueba la conexión e inténtalo de nuevo.</p>`;
+  }
+}
+
+function confirmar(fecha) {
+  const hora = fecha.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+  app.innerHTML = `
+    <div class="confirmacion">
+      <div class="icono">🔒</div>
+      <h2>Puerta cerrada</h2>
+      <p class="hora">Registrado a las ${hora}</p>
+      <a href="./">Ver todos los registros</a>
+    </div>`;
+}
+
+async function listar() {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/${TABLA}?select=creado_en&order=creado_en.desc&limit=300`,
+      { headers: cabeceras }
+    );
+    if (!res.ok) throw new Error(await res.text());
+    const filas = await res.json();
+
+    if (filas.length === 0) {
+      app.innerHTML = cabecera() + `<p class="vacio">Aún no hay registros.<br>Pasa el móvil por el sticker al cerrar la puerta.</p>`;
+      return;
+    }
+
+    const fmtDia = new Intl.DateTimeFormat("es-ES", { weekday: "long", day: "numeric", month: "long" });
+    const fmtHora = new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit" });
+
+    let html = cabecera();
+    let diaActual = "";
+    for (const fila of filas) {
+      const fecha = new Date(fila.creado_en);
+      const dia = fmtDia.format(fecha);
+      if (dia !== diaActual) {
+        diaActual = dia;
+        html += `<div class="dia">${dia}</div>`;
+      }
+      html += `
+        <div class="registro">
+          <span class="hora">${fmtHora.format(fecha)}</span>
+          <span class="etiqueta">🔒 cerrada</span>
+        </div>`;
+    }
+    app.innerHTML = html;
+  } catch (e) {
+    app.innerHTML = cabecera() + `<p class="error">No se pudieron cargar los registros.</p>`;
+  }
+}
+
+function cabecera() {
+  return `<h1>Puerta de casa</h1><p class="subtitulo">Registros de cierre con llave</p>`;
+}
+</script>
+</body>
+</html>
